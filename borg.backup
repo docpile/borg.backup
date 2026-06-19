@@ -1,0 +1,1082 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# BORG BARE-METAL MASTER SCRIPT
+# ==============================================================================
+# Mission: 1:1 System Backups to Hetzner Storage Box & LIVE Bare-Metal Recovery
+# Architecture: 2-File Fire & Forget (Config + Script). Keys Vaulted on Hetzner.
+# ==============================================================================
+
+set -u
+
+# ==============================================================================
+# CONFIGURATION INGESTION & SANITATION
+# ==============================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/int.backup.borg.config"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo -e "\n[FATAL ERROR] Configuration file missing: $CONFIG_FILE"
+    echo "Please create 'int.backup.borg.config' in the script directory."
+    exit 1
+fi
+
+source "$CONFIG_FILE"
+
+# Auto-correct missing Hetzner Username in CONF_REPO
+if [[ "$CONF_REPO" == ssh://* ]] && [[ ! "$CONF_REPO" == *"@"* ]]; then
+    raw_target="${CONF_REPO#ssh://}"
+    raw_host="${raw_target%%:*}"
+    raw_user="${raw_host%%.*}"
+    CONF_REPO="ssh://${raw_user}@${raw_target}"
+fi
+
+# ==============================================================================
+# EXPORTS & ENV SETUP
+# ==============================================================================
+export BORG_REPO="$CONF_REPO"
+export BORG_PASSPHRASE="$CONF_PASSPHRASE"
+export BORG_RSH="ssh -i $CONF_SSH_KEY -p 23 -o StrictHostKeyChecking=accept-new"
+
+script_name="${0##*/}"
+
+# ==============================================================================
+# FUNCTIONS
+# ==============================================================================
+
+print_msg() { echo -e "\n=============================================================================\n[$(date '+%Y-%m-%d %H:%M:%S')] => $1 \n"; }
+die() { echo -e "\n[FATAL ERROR] $1" >&2; exit 1; }
+
+sync_borg_version() {
+    if command -v borg >/dev/null 2>&1; then
+        local ver
+        ver=$(borg --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -n1)
+        if [ -n "$ver" ]; then
+            export BORG_REMOTE_PATH="borg-${ver}"
+        fi
+    fi
+}
+
+setup_ssh_connection() {
+    print_msg "Verifying/Configuring SSH Key Authentication"
+
+    local ssh_dir
+    ssh_dir=$(dirname "$CONF_SSH_KEY")
+    mkdir -p "$ssh_dir"
+
+    # Safely extract variables
+    local repo_target="${CONF_REPO#*://}"
+    repo_target="${repo_target%%/*}"
+    local borg_port="${repo_target##*:}"
+    local auth_host="${repo_target%:*}"
+    local file_port="22" 
+
+    local ssh_user
+    local ssh_host
+    if [[ "$auth_host" == *"@"* ]]; then
+        ssh_user="${auth_host%%@*}"
+        ssh_host="${auth_host#*@}"
+    else
+        ssh_host="$auth_host"
+        ssh_user="${ssh_host%%.*}" 
+    fi
+
+    # Ensure sshpass is installed immediately to interact with the Hetzner Vault
+    if ! command -v sshpass >/dev/null 2>&1; then
+        print_msg "sshpass not found. Installing dynamically..."
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq && apt-get install -yqq sshpass
+    fi
+
+    local vault_path=".ssh/vault_${CONF_MACHINE_NAME}_id"
+    local key_needs_vaulting="false"
+
+    if [ ! -f "$CONF_SSH_KEY" ]; then
+        print_msg "Local SSH key missing. Searching Hetzner Vault for disaster recovery..."
+        export SSHPASS="$CONF_SSH_PASSWORD"
+        
+        # Pre-scan port 22 to prevent sshpass stalling
+        ssh-keyscan -p "$file_port" "$ssh_host" >> ~/.ssh/known_hosts 2>/dev/null
+        
+        if sshpass -e scp -P "$file_port" -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -q "${ssh_user}@${ssh_host}:${vault_path}" "$CONF_SSH_KEY" >/dev/null 2>&1; then
+            print_msg "Success! Private key recovered from Hetzner Vault."
+            chmod 600 "$CONF_SSH_KEY"
+            sshpass -e scp -P "$file_port" -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -q "${ssh_user}@${ssh_host}:${vault_path}.pub" "${CONF_SSH_KEY}.pub" >/dev/null 2>&1 || true
+        else
+            print_msg "No key found in Hetzner Vault. Generating new SSH key..."
+            ssh-keygen -t ed25519 -f "$CONF_SSH_KEY" -C "borg-${CONF_MACHINE_NAME}" -N "" -q
+            key_needs_vaulting="true"
+        fi
+    fi
+
+    print_msg "Testing passwordless SSH connection on Port ${borg_port}..."
+    
+    if ! ssh -i "$CONF_SSH_KEY" -p "$borg_port" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${ssh_user}@${ssh_host}" pwd >/dev/null 2>&1; then
+        print_msg "Key not recognized. Installing safely via SSH/SCP (Password Enabled)..."
+
+        export SSHPASS="$CONF_SSH_PASSWORD"
+        ssh-keyscan -p "$file_port" "$ssh_host" >> ~/.ssh/known_hosts 2>/dev/null
+        
+        local tmp_keys="/tmp/auth_keys_$(date +%s)"
+        local clean_keys="/tmp/clean_keys_$(date +%s)"
+        touch "$tmp_keys"
+
+        # 1. Prepare remote directory
+        sshpass -e ssh -p "$file_port" -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no "${ssh_user}@${ssh_host}" mkdir .ssh >/dev/null 2>&1 || true
+        sshpass -e ssh -p "$file_port" -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no "${ssh_user}@${ssh_host}" chmod 700 .ssh >/dev/null 2>&1 || true
+
+        # 2. Download, clean, and prepare authorized_keys
+        sshpass -e scp -P "$file_port" -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -q "${ssh_user}@${ssh_host}:.ssh/authorized_keys" "$tmp_keys" >/dev/null 2>&1 || true
+        grep -v "borg-${CONF_MACHINE_NAME}$" "$tmp_keys" > "$clean_keys" || true
+        cat "${CONF_SSH_KEY}.pub" >> "$clean_keys"
+
+        # 3. Upload authorized_keys
+        print_msg "Uploading configured SSH key to Hetzner..."
+        local scp_out
+        scp_out=$(sshpass -e scp -P "$file_port" -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -q "$clean_keys" "${ssh_user}@${ssh_host}:.ssh/authorized_keys" 2>&1)
+        local scp_exit=$?
+        sshpass -e ssh -p "$file_port" -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no "${ssh_user}@${ssh_host}" chmod 600 .ssh/authorized_keys >/dev/null 2>&1 || true
+
+        if [ $scp_exit -ne 0 ]; then
+            rm -f "$tmp_keys" "$clean_keys"
+            die "SCP key upload failed. Exit Code: $scp_exit\nRaw Output:\n$scp_out"
+        fi
+
+        # 4. Upload to the Key Vault if it's a freshly generated key
+        if [ "$key_needs_vaulting" = "true" ]; then
+            print_msg "Vaulting private key on Hetzner for future bare-metal restores..."
+            sshpass -e scp -P "$file_port" -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -q "$CONF_SSH_KEY" "${ssh_user}@${ssh_host}:${vault_path}"
+            sshpass -e scp -P "$file_port" -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -q "${CONF_SSH_KEY}.pub" "${ssh_user}@${ssh_host}:${vault_path}.pub"
+            sshpass -e ssh -p "$file_port" -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no "${ssh_user}@${ssh_host}" "chmod 600 ${vault_path} && chmod 644 ${vault_path}.pub" >/dev/null 2>&1 || true
+        fi
+
+        rm -f "$tmp_keys" "$clean_keys"
+
+        if ! ssh -i "$CONF_SSH_KEY" -p "$borg_port" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${ssh_user}@${ssh_host}" pwd >/dev/null 2>&1; then
+            die "Key upload succeeded, but the key was rejected by Hetzner on Port $borg_port."
+        fi
+
+        print_msg "SSH Key successfully installed and deduplicated!"
+    else
+        print_msg "Passwordless SSH connection is already working."
+    fi
+}
+
+do_housekeeping() {
+    print_msg "Starting Global SSH Key Housekeeping on Hetzner"
+    setup_ssh_connection
+    
+    local repo_target="${CONF_REPO#*://}"
+    repo_target="${repo_target%%/*}"
+    local borg_port="${repo_target##*:}"
+    local auth_host="${repo_target%:*}"
+
+    local ssh_user
+    local ssh_host
+    if [[ "$auth_host" == *"@"* ]]; then
+        ssh_user="${auth_host%%@*}"
+        ssh_host="${auth_host#*@}"
+    else
+        ssh_host="$auth_host"
+        ssh_user="${ssh_host%%.*}"
+    fi
+    
+    local base_path="${CONF_REPO_BASE#*./}"
+    
+    print_msg "Fetching active machine repositories via SSH..."
+    local active_machines
+    active_machines=$(ssh -p "$borg_port" -i "$CONF_SSH_KEY" -o StrictHostKeyChecking=accept-new "${ssh_user}@${ssh_host}" ls -1 "$base_path" 2>/dev/null | tr -d '\r' | grep -v "^${script_name}$")
+    
+    print_msg "Fetching authorized_keys via SCP..."
+    local tmp_keys="/tmp/auth_keys_$(date +%s)"
+    local clean_keys="/tmp/clean_keys_$(date +%s)"
+    
+    scp -P "$borg_port" -i "$CONF_SSH_KEY" -o StrictHostKeyChecking=accept-new -q "${ssh_user}@${ssh_host}:.ssh/authorized_keys" "$tmp_keys" 2>/dev/null || touch "$tmp_keys"
+    
+    local keys_removed=0
+    > "$clean_keys"
+    
+    while IFS= read -r line; do
+        if [ -z "$line" ]; then continue; fi
+        local comment
+        comment=$(echo "$line" | awk '{print $NF}')
+        
+        if [[ "$comment" == borg-* ]]; then
+            local machine="${comment#borg-}"
+            
+            if [ "$machine" = "$CONF_MACHINE_NAME" ]; then
+                echo "$line" >> "$clean_keys"
+            elif echo "$active_machines" | grep -Fqx "$machine"; then
+                echo "$line" >> "$clean_keys"
+            else
+                echo "  [Stale Key Purged] Repository missing for decommissioned machine: '$machine'"
+                keys_removed=$((keys_removed + 1))
+            fi
+        else
+            echo "$line" >> "$clean_keys"
+        fi
+    done < "$tmp_keys"
+    
+    if [ "$keys_removed" -gt 0 ]; then
+        print_msg "Uploading cleaned authorized_keys via SCP ($keys_removed removed)..."
+        scp -P "$borg_port" -i "$CONF_SSH_KEY" -o StrictHostKeyChecking=accept-new -q "$clean_keys" "${ssh_user}@${ssh_host}:.ssh/authorized_keys"
+        print_msg "Housekeeping complete."
+    else
+        print_msg "Housekeeping complete. No stale keys found."
+    fi
+    
+    rm -f "$tmp_keys" "$clean_keys"
+}
+
+do_install() {
+    print_msg "Installing requirements \n(Borg, Openssh-Client, MariaDB-Client, Rsync, SshPass)"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq && apt-get install -yqq borgbackup openssh-client mariadb-client rsync sshpass
+
+    setup_ssh_connection
+    sync_borg_version
+
+    print_msg "Preparing remote directory structure"
+    local repo_target="${CONF_REPO#*://}"
+    repo_target="${repo_target%%/*}"
+    local borg_port="${repo_target##*:}"
+    local auth_host="${repo_target%:*}"
+    
+    local ssh_user
+    local ssh_host
+    if [[ "$auth_host" == *"@"* ]]; then
+        ssh_user="${auth_host%%@*}"
+        ssh_host="${auth_host#*@}"
+    else
+        ssh_host="$auth_host"
+        ssh_user="${ssh_host%%.*}"
+    fi
+
+    local remote_full_path="${CONF_REPO#*./}"
+    local remote_base_dir=$(dirname "$remote_full_path")
+    local remote_script_path="${remote_base_dir}/${script_name}"
+
+    ssh -p "$borg_port" -i "$CONF_SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${ssh_user}@${ssh_host}" "mkdir -p ${remote_base_dir}" >/dev/null 2>&1 || true
+
+    print_msg "Checking master script status on Hetzner..."
+    if ! ssh -p "$borg_port" -i "$CONF_SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes -q "${ssh_user}@${ssh_host}" stat "$remote_script_path" >/dev/null 2>&1; then
+        echo " -> Master script is missing on Hetzner. Seeding now..."
+        rsync -t -e "ssh -p $borg_port -i $CONF_SSH_KEY -o StrictHostKeyChecking=accept-new -q" "$0" "${ssh_user}@${ssh_host}:${remote_script_path}"
+        echo " -> Success: Master script copied to Hetzner."
+    else
+        local needs_push
+        needs_push=$(rsync -tui --dry-run -e "ssh -p $borg_port -i $CONF_SSH_KEY -o StrictHostKeyChecking=accept-new -q" "$0" "${ssh_user}@${ssh_host}:${remote_script_path}" 2>/dev/null || true)
+		
+        if [ -n "$needs_push" ]; then
+            echo " -> Master script exists, but your LOCAL version is newer."
+            read -p "Do you want to update the master version on Hetzner? (y/N) " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                rsync -t -e "ssh -p $borg_port -i $CONF_SSH_KEY -o StrictHostKeyChecking=accept-new -q" "$0" "${ssh_user}@${ssh_host}:${remote_script_path}"
+                echo " -> Success: Master script updated on Hetzner."
+            else
+                echo " -> Skipped: User aborted update."
+            fi
+        else
+            echo " -> Skipped: Master script already exists and is up to date."
+        fi
+    fi
+	
+    print_msg "Attempting to initialize the Borg repository at $CONF_REPO..."
+    borg init --encryption=repokey || echo "Repository may already be initialized. Skipping."
+    print_msg "Install routine finished."
+}
+
+do_backup() {
+    local custom_comment="${1:-}"
+    sync_borg_version
+    print_msg "Starting Full System Backup for $CONF_MACHINE_NAME (Using: ${BORG_REMOTE_PATH:-default})"
+
+    if [ "$CONF_DUMP_DB" = true ]; then
+        if command -v mysqldump >/dev/null 2>&1 && mysqladmin ping >/dev/null 2>&1; then
+            print_msg "Dumping databases for consistency"
+            mkdir -p "$CONF_DB_DUMP_DIR"
+            mysqldump --all-databases --single-transaction --quick --lock-tables=false > "$CONF_DB_DUMP_DIR/all-databases-$(date +%F).sql"
+            find "$CONF_DB_DUMP_DIR" -name "*.sql" -mtime +3 -delete
+        else
+            print_msg "Database dump requested, but MySQL/MariaDB is not installed or not running. Skipping."
+        fi
+    fi
+
+    local archive_name="${CONF_ARCHIVE_PREFIX}$(date '+%Y-%m-%d-%H%M')"
+
+    local borg_opts=(
+        --verbose
+        --stats
+        --show-rc
+        --compression "$CONF_COMPRESSION"
+    )
+
+    if [ -n "$custom_comment" ]; then
+        print_msg "Attaching custom comment: $custom_comment"
+        borg_opts+=(--comment "$custom_comment")
+    fi
+
+    print_msg "Creating archive: $archive_name"
+    borg create "${borg_opts[@]}" ::"$archive_name" / "${CONF_EXCLUDES[@]}"
+
+    local backup_exit=$?
+
+    if [ $backup_exit -eq 0 ] || [ $backup_exit -eq 1 ]; then
+        print_msg "Backup successful. Pruning old backups."
+        borg prune \
+            --list \
+            --glob-archives "${CONF_ARCHIVE_PREFIX}*" \
+            --show-rc \
+            --keep-within "24H" \
+			--keep-daily "$CONF_KEEP_DAILY" \
+            --keep-weekly "$CONF_KEEP_WEEKLY" \
+            --keep-monthly "$CONF_KEEP_MONTHLY"
+		
+        print_msg "Compacting repository to free physical disk space."
+        borg compact --show-rc
+		
+    else
+        die "Backup failed with exit code $backup_exit"
+    fi
+}
+
+do_check() {
+    sync_borg_version
+    print_msg "Verifying backup repository integrity"
+    borg check --repository-only --show-rc
+}
+
+do_list() {
+    sync_borg_version
+    print_msg "Available backup archives for $CONF_MACHINE_NAME:"
+    borg list --format "{archive:<36} {time} {comment}{NL}" --show-rc
+}
+
+
+select_repository() {
+    print_msg "Fetching available repositories from Hetzner..." >&2
+    
+    local repo_target="${CONF_REPO#*://}"
+    repo_target="${repo_target%%/*}"
+    local borg_port="${repo_target##*:}"
+    local auth_host="${repo_target%:*}"
+    
+    local ssh_user
+    local ssh_host
+    if [[ "$auth_host" == *"@"* ]]; then
+        ssh_user="${auth_host%%@*}"
+        ssh_host="${auth_host#*@}"
+    else
+        ssh_host="$auth_host"
+        ssh_user="${ssh_host%%.*}"
+    fi
+
+    local remote_full_path="${CONF_REPO#*./}"
+    local remote_base_dir
+    remote_base_dir=$(dirname "$remote_full_path")
+
+    mapfile -t repo_list < <(ssh -p "$borg_port" -i "$CONF_SSH_KEY" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${ssh_user}@${ssh_host}" ls -1 "$remote_base_dir" 2>/dev/null | tr -d '\r' | grep -v "^${script_name}$")
+
+    if [ ${#repo_list[@]} -eq 0 ]; then
+        echo "Could not auto-detect repositories. Using default config repository." >&2
+        return
+    fi
+
+    echo "" >&2
+    echo "========================================================" >&2
+    echo "                 AVAILABLE REPOSITORIES" >&2
+    echo "========================================================" >&2
+    local current_idx=1
+    for i in "${!repo_list[@]}"; do
+        local marker=" "
+        local repo_url="ssh://${ssh_user}@${ssh_host}:${borg_port}/./${remote_base_dir}/${repo_list[$i]}"
+        if [ "$repo_url" = "$CONF_REPO" ]; then
+            marker="*"
+            current_idx=$((i+1))
+        fi
+        printf " %s%2d) %s\n" "$marker" "$((i+1))" "${repo_list[$i]}" >&2
+    done
+    echo "========================================================" >&2
+    echo " * = Current default (from config)" >&2
+    echo "" >&2
+
+    local selection
+    read -p "Select the repository to use (1-${#repo_list[@]}) [Default: $current_idx]: " selection >&2
+
+    if [ -z "$selection" ]; then
+        selection=$current_idx
+    fi
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "${#repo_list[@]}" ]; then
+        echo "Invalid selection. Proceeding with default repository." >&2
+    else
+        export BORG_REPO="ssh://${ssh_user}@${ssh_host}:${borg_port}/./${remote_base_dir}/${repo_list[$((selection-1))]}"
+        echo " -> Active Repository set to: $BORG_REPO" >&2
+    fi
+}
+
+select_archive() {
+    print_msg "Fetching available backups from Hetzner..." >&2
+    
+    # Use formatted output for the visual menu so comments are visible
+    mapfile -t full_list < <(borg list --format "{archive:<36} {time} {comment}{NL}" 2>/dev/null)
+    # Keep short output purely for fetching the exact archive string name invisibly
+    mapfile -t short_list < <(borg list --short 2>/dev/null)
+
+    if [ ${#short_list[@]} -eq 0 ]; then
+        die "No archives found in the repository."
+    fi
+
+    echo "" >&2
+    echo "========================================================" >&2
+    echo "                 AVAILABLE BACKUPS" >&2
+    echo "========================================================" >&2
+    for i in "${!full_list[@]}"; do
+        printf " %2d) %s\n" "$((i+1))" "${full_list[$i]}" >&2
+    done
+    echo "========================================================" >&2
+    echo "" >&2
+
+    local selection
+    read -p "Enter the number of the backup to use (1-${#short_list[@]}): " selection >&2
+
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "${#short_list[@]}" ]; then
+        die "Invalid selection. Aborting."
+    fi
+
+    echo "${short_list[$((selection-1))]}"
+}
+
+do_restore_file() {
+    setup_ssh_connection
+    sync_borg_version
+	
+	select_repository
+
+    local archive="${2:-}"
+    if [ -z "$archive" ]; then
+        archive=$(select_archive)
+    fi
+
+    local target_path="${3:-}"
+    if [ -z "$target_path" ]; then
+        read -p "Enter the absolute path of the file/directory to restore (e.g., /etc/fstab): " target_path
+    fi
+    
+    local restore_dir="/tmp/borg_restore_$(date +%s)"
+    mkdir -p "$restore_dir"
+    cd "$restore_dir" || die "Cannot cd to $restore_dir"
+    
+    print_msg "Restoring $target_path from $archive to $restore_dir"
+    borg extract --list ::"$archive" "${target_path#/}" || die "File extraction failed! Aborting."
+}
+
+do_restore_live() {
+    setup_ssh_connection
+    sync_borg_version
+    
+    select_repository
+
+    local archive="${2:-}"
+    if [ -z "$archive" ]; then
+        archive=$(select_archive)
+    fi
+
+    # Strip hidden carriage returns/whitespaces
+    archive=$(echo -n "$archive" | tr -d '\r' | xargs)
+
+    if [ -z "$archive" ]; then
+        die "Archive selection resulted in an empty string. Aborting."
+    fi
+
+    local stage_dir="/restore_stage"
+
+    print_msg "WARNING: LIVE KAMIKAZE RESTORE INITIATED"
+    echo "Target: $CONF_MACHINE_NAME"
+    echo "Archive: $archive"
+    echo "This will extract the backup and overwrite the currently running minimal OS."
+    echo "Exclusion directories (e.g. /dev, /proc) will NOT be touched or deleted."
+    echo "SSH connectivity will likely sever at the end, followed by a hard reset."
+    read -p "Are you absolutely sure you want to overwrite this server? (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        die "Aborted."
+    fi
+
+    # ==============================================================================
+    # THE SIGHUP SHIELD (Bash-Native Session Detachment)
+    # ==============================================================================
+    local log_file="/dev/shm/kamikaze_restore.log"
+    > "$log_file"
+
+    print_msg "Engaging native SIGHUP shield..."
+    echo "The restore is detaching from the terminal to protect against SSH disconnects."
+    echo "If your connection drops, the server WILL continue the restore and reboot automatically."
+    echo "Live progress will now be streamed below:"
+    echo "--------------------------------------------------------------------------------"
+
+    {
+        trap '' HUP PIPE # Render this subshell immune to disconnects and broken pipes
+
+    # 1. Break Stale Locks
+    print_msg "Clearing any stale Hetzner repository locks..."
+    borg break-lock || true
+
+    # 2. Hardware State Capture
+    print_msg "Capturing current hardware network configurations and UUIDs..."
+    local safe_hw_dir="/tmp/safe_hw_config"
+    mkdir -p "$safe_hw_dir"
+    
+    if [ -d /etc/netplan ]; then
+        cp -a /etc/netplan "$safe_hw_dir/"
+    fi
+
+    # Capture LIVE Network State
+    local live_iface=$(ip -4 route show default | awk '{print $5}' | head -n1)
+    local live_gw=$(ip -4 route show default | awk '{print $3}' | head -n1)
+    local live_ip_cidr=$(ip -4 addr show dev "$live_iface" | grep -w inet | awk '{print $2}' | head -n1)
+    local live_ip="${live_ip_cidr%/*}"
+    local live_mac1=$(ip link show "$live_iface" | awk '/ether/ {print $2}')
+    
+    # Capture secondary vLAN interface MAC if it exists
+    local live_iface_sec=$(ip -o link show | awk -F': ' '$2 !~ /lo|'"$live_iface"'/ {print $2}' | tr -d ' ' | head -n1)
+    local live_mac2=""
+    if [ -n "$live_iface_sec" ]; then
+        live_mac2=$(ip link show "$live_iface_sec" | awk '/ether/ {print $2}')
+    fi
+
+    # Extract up to 2 primary DNS servers (Fallback to 8.8.8.8 and 1.1.1.1 if empty)
+    local live_dns=$(awk '/^nameserver/ {print $2}' /etc/resolv.conf | grep -E '^[0-9]' | head -n 2 | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
+    if [ -z "$live_dns" ]; then live_dns="8.8.8.8, 1.1.1.1"; fi
+    
+    # Capture critical physical boot and swap UUIDs from the live minimal OS
+    local live_root_uuid live_boot_uuid live_efi_uuid live_swap_uuid
+    live_root_uuid=$(findmnt -n -o UUID / || true)
+    live_boot_uuid=$(findmnt -n -o UUID /boot || true)
+    live_efi_uuid=$(findmnt -n -o UUID /boot/efi || true)
+    live_swap_uuid=$(blkid -t TYPE=swap -s UUID -o value | head -n1 || true)
+
+    # 2.5 Spatial Pre-Flight Check
+    print_msg "Calculating spatial requirements (checking disk space)..."
+    local required_bytes
+    required_bytes=$(borg info --json ::"$archive" 2>/dev/null | python3 -c "import sys, json; d=json.load(sys.stdin); print(d['archives'][0]['stats']['original_size']) if 'archives' in d else sys.exit(1)" 2>/dev/null)
+    
+    if [ -z "$required_bytes" ] || ! [[ "$required_bytes" =~ ^[0-9]+$ ]]; then
+        die "Failed to parse spatial requirements. Archive '$archive' is inaccessible or invalid."
+    fi
+
+    local free_bytes
+    free_bytes=$(df -B1 / | awk 'NR==2 {print $4}')
+    
+    # Add a 10% safety buffer for temporary files and Borg cache
+    local buffered_bytes=$(( required_bytes + (required_bytes / 10) ))
+    
+    if [ "$free_bytes" -lt "$buffered_bytes" ]; then
+        local req_gb=$(( buffered_bytes / 1024 / 1024 / 1024 ))
+        local free_gb=$(( free_bytes / 1024 / 1024 / 1024 ))
+        die "Insufficient disk space! Archive requires ~${req_gb}GB, but only ${free_gb}GB is free on /. You cannot stage a live restore here."
+    fi
+
+    # 3. Prepare Staging Area
+    print_msg "Creating staging area at $stage_dir..."
+    rm -rf "${stage_dir:?}"
+    mkdir -p "$stage_dir"
+    cd "$stage_dir" || die "Failed to enter $stage_dir"
+
+    # 4. Extract Archive
+    print_msg "Extracting $archive to staging area..."
+    echo "The metadata sync and the restore can take some time, seemingly without further progress. Do not cancel!"
+    echo " "
+    borg extract --sparse --numeric-ids ::"$archive" || die "Extraction failed! Aborting immediately to prevent system wipe."
+
+    # ==============================================================================
+    # PRE-SWAP CONSOLIDATION: Hardware State Injection (Targeting Staging Area)
+    # ==============================================================================
+    print_msg "Injecting hardware configurations into staging area..."
+
+    # 1. FSTAB Patching
+    if [ -f "$stage_dir/etc/fstab" ]; then
+        # Use awk to reliably target mount points regardless of how the source block device was named
+        if [ -n "$live_root_uuid" ]; then
+            awk -v uuid="UUID=$live_root_uuid" '(!/^#/ && $2 == "/") { $1=uuid } 1' "$stage_dir/etc/fstab" > "$stage_dir/etc/fstab.tmp" && mv "$stage_dir/etc/fstab.tmp" "$stage_dir/etc/fstab"
+        fi
+        
+        if [ -n "$live_boot_uuid" ]; then
+            awk -v uuid="UUID=$live_boot_uuid" '(!/^#/ && $2 == "/boot") { $1=uuid } 1' "$stage_dir/etc/fstab" > "$stage_dir/etc/fstab.tmp" && mv "$stage_dir/etc/fstab.tmp" "$stage_dir/etc/fstab"
+        fi
+        
+        if [ -n "$live_efi_uuid" ]; then
+            awk -v uuid="UUID=$live_efi_uuid" '(!/^#/ && $2 == "/boot/efi") { $1=uuid } 1' "$stage_dir/etc/fstab" > "$stage_dir/etc/fstab.tmp" && mv "$stage_dir/etc/fstab.tmp" "$stage_dir/etc/fstab"
+        fi
+        
+        # Handle Swap Partitions (Block Devices)
+        if [ -n "$live_swap_uuid" ]; then
+            awk -v uuid="UUID=$live_swap_uuid" '(!/^#/ && $3 == "swap" && $1 !~ /^\//) { $1=uuid } 1' "$stage_dir/etc/fstab" > "$stage_dir/etc/fstab.tmp" && mv "$stage_dir/etc/fstab.tmp" "$stage_dir/etc/fstab"
+        else
+            awk '(!/^#/ && $3 == "swap" && $1 !~ /^\//) { print "# DISABLED (No live swap part found): " $0; next } 1' "$stage_dir/etc/fstab" > "$stage_dir/etc/fstab.tmp" && mv "$stage_dir/etc/fstab.tmp" "$stage_dir/etc/fstab"
+        fi
+
+        # Recreate Excluded Swap Files
+        local swap_file
+        swap_file=$(awk '(!/^#/ && $3 == "swap" && $1 ~ /^\//) {print $1}' "$stage_dir/etc/fstab" | head -n1)
+        if [ -n "$swap_file" ] && [ ! -f "$stage_dir$swap_file" ]; then
+            print_msg " -> Recreating excluded swap file ($swap_file) to prevent boot failure..."
+            fallocate -l 2G "$stage_dir$swap_file" 2>/dev/null || dd if=/dev/zero of="$stage_dir$swap_file" bs=1M count=2048 status=none
+            chmod 600 "$stage_dir$swap_file"
+            mkswap "$stage_dir$swap_file" >/dev/null 2>&1 || true
+        fi
+        
+        # Add nofail to secondary non-critical mounts to prevent boot hangs if auxiliary drives are missing
+        awk '(!/^#/ && $2 != "/" && $2 !~ /^\/boot/ && $3 != "swap") { if ($4 !~ /nofail/) $4=$4",nofail" } 1' "$stage_dir/etc/fstab" > "$stage_dir/etc/fstab.tmp" && mv "$stage_dir/etc/fstab.tmp" "$stage_dir/etc/fstab"
+    fi
+
+    # 2. Netplan Patching
+    local target_np=$(find "$stage_dir/etc/netplan" -type f -name "*.yaml" | head -n 1)
+    if [ -n "$target_np" ] && [ -n "$live_ip_cidr" ]; then
+        local old_gw=$(awk '/to: (0\.0\.0\.0\/0|default)/ {getline; print $2}' "$target_np" | tr -d '"'\''')
+        local old_ip_cidr=$(grep -E '^\s*- [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' "$target_np" | head -n1 | awk '{print $2}')
+        local old_ip="${old_ip_cidr%/*}"
+
+        if [ -n "$old_ip_cidr" ]; then
+            sed -i -E "s|\\b${old_ip_cidr}\\b|${live_ip_cidr}|g" "$target_np"
+            sed -i -E "s|\\b${old_ip}\\b|${live_ip}|g" "$target_np"
+        fi
+        if [ -n "$old_gw" ] && [ -n "$live_gw" ]; then
+            sed -i -E "s|\\b${old_gw}\\b|${live_gw}|g" "$target_np"
+        fi
+        sed -i -E "s|addresses: \[[0-9\., ]+\]|addresses: [${live_dns}, 8.8.8.8]|g" "$target_np"
+        
+        if [ -n "$live_mac1" ] && [ -n "$live_iface" ]; then
+            awk -v iface="^[[:space:]]*${live_iface}:" -v mac="${live_mac1}" '$0 ~ iface { m=1 } m && /macaddress:/ { sub(/macaddress:.*/, "macaddress: " mac); m=0 } 1' "$target_np" > "${target_np}.tmp" && mv "${target_np}.tmp" "$target_np"
+        fi
+        if [ -n "$live_mac2" ] && [ -n "$live_iface_sec" ]; then
+            awk -v iface="^[[:space:]]*${live_iface_sec}:" -v mac="${live_mac2}" '$0 ~ iface { m=1 } m && /macaddress:/ { sub(/macaddress:.*/, "macaddress: " mac); m=0 } 1' "$target_np" > "${target_np}.tmp" && mv "${target_np}.tmp" "$target_np"
+        fi
+    fi
+
+    # 3. Hardware / Cloud-Init Cleanup
+    touch "$stage_dir/etc/cloud/cloud-init.disabled" 2>/dev/null || true
+    rm -rf "$stage_dir/var/lib/cloud/"* 2>/dev/null || true
+    rm -f "$stage_dir/etc/udev/rules.d/70-persistent-net.rules" 2>/dev/null || true
+    rm -f "$stage_dir/etc/udev/rules.d/80-net-setup-link.rules" 2>/dev/null || true
+
+    # 4. CPU Microcode Alignment
+    local cpu_vendor=$(grep -m 1 'vendor_id' /proc/cpuinfo | awk '{print $3}')
+    local target_microcode=""
+    if [ "$cpu_vendor" = "GenuineIntel" ]; then
+        target_microcode="intel-microcode"
+    elif [ "$cpu_vendor" = "AuthenticAMD" ]; then
+        target_microcode="amd64-microcode"
+    fi
+    if [ -n "$target_microcode" ]; then
+        print_msg " -> Scheduling $target_microcode auto-install on next boot..."
+        echo '#!/bin/bash' > "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo '# Wait for DNS and basic routing to initialize' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo 'until ping -c 1 archive.ubuntu.com >/dev/null 2>&1; do sleep 5; done' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo 'export DEBIAN_FRONTEND=noninteractive' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo 'apt-get update -qq' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo "apt-get install -yqq $target_microcode" >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo 'systemctl disable microcode-installer.service >/dev/null 2>&1' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo 'rm -f /etc/systemd/system/microcode-installer.service' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo 'rm -f "$0"' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        chmod +x "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        
+        echo '[Unit]' > "$stage_dir/etc/systemd/system/microcode-installer.service"
+        echo 'Description=One-time Hardware Microcode Installer' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
+        echo 'After=network-online.target systemd-resolved.service' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
+        echo 'Wants=network-online.target' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
+        echo '' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
+        echo '[Service]' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
+        echo 'Type=simple' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
+        echo 'ExecStart=/usr/local/bin/install-microcode-once.sh' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
+        echo '' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
+        echo '[Install]' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
+        echo 'WantedBy=multi-user.target' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
+        mkdir -p "$stage_dir/etc/systemd/system/multi-user.target.wants"
+        ln -sf /etc/systemd/system/microcode-installer.service "$stage_dir/etc/systemd/system/multi-user.target.wants/microcode-installer.service"
+    fi
+
+    # 4.5 Post-Restore Auto-Update Initialization
+    if [ "${CONF_AUTO_UPDATE_AFTER_RESTORE:-false}" = "true" ]; then
+        print_msg " -> Scheduling post-restore system auto-update for the next boot..."
+        
+        local updater_script="$stage_dir/usr/local/bin/post-restore-update-once.sh"
+        local updater_service="$stage_dir/etc/systemd/system/post-restore-update-once.service"
+        
+        echo '#!/bin/bash' > "$updater_script"
+        echo '# Wait for DNS and basic routing to initialize' >> "$updater_script"
+        echo 'until ping -c 1 archive.ubuntu.com >/dev/null 2>&1; do sleep 5; done' >> "$updater_script"
+        echo 'export DEBIAN_FRONTEND=noninteractive' >> "$updater_script"
+        echo 'dpkg --configure -a' >> "$updater_script" # Safety net for interrupted dpkg states
+        echo 'apt-get update -qq' >> "$updater_script"
+        echo 'apt-get upgrade -yqq' >> "$updater_script"
+        echo 'apt-get autoremove -yqq' >> "$updater_script"
+        echo '# Self-destruct sequence' >> "$updater_script"
+        echo 'systemctl disable post-restore-update-once.service >/dev/null 2>&1' >> "$updater_script"
+        echo 'rm -f /etc/systemd/system/post-restore-update-once.service' >> "$updater_script"
+        echo 'rm -f "$0"' >> "$updater_script"
+        chmod +x "$updater_script"
+        
+        echo '[Unit]' > "$updater_service"
+        echo 'Description=One-time Post-Restore System Update' >> "$updater_service"
+        echo 'After=network-online.target systemd-resolved.service' >> "$updater_service"
+        echo 'Wants=network-online.target' >> "$updater_service"
+        echo '' >> "$updater_service"
+        echo '[Service]' >> "$updater_service"
+        echo 'Type=simple' >> "$updater_service"
+        echo 'ExecStart=/usr/local/bin/post-restore-update-once.sh' >> "$updater_service"
+        echo '' >> "$updater_service"
+        echo '[Install]' >> "$updater_service"
+        echo 'WantedBy=multi-user.target' >> "$updater_service"
+        
+        mkdir -p "$stage_dir/etc/systemd/system/multi-user.target.wants"
+        ln -sf /etc/systemd/system/post-restore-update-once.service "$stage_dir/etc/systemd/system/multi-user.target.wants/post-restore-update-once.service"
+    fi
+
+    # 5. Application State & Run-Once Sync Adjustments
+    print_msg " -> Adjusting cluster and maintenance states..."
+    CUR_CLUSTER_STATUS=""
+    if [ -f "$stage_dir/private-backup/var/clusterstatus" ] ; then 
+        CUR_CLUSTER_STATUS="$(cat "$stage_dir/private-backup/var/clusterstatus")" 
+        if [ "$CUR_CLUSTER_STATUS" == "ACTIVE" ] ; then echo "PASSIVE" > "$stage_dir/private-backup/var/clusterstatus" ; fi
+    fi
+    
+    if [ -d "$stage_dir/private-backup/etc" ]; then
+        local current_date=$(date '+%y-%m-%d %H-%M-%S')
+        echo "$current_date" > "$stage_dir/private-backup/etc/int.maintenance.nosync.status"
+        echo "$current_date" > "$stage_dir/private-backup/etc/int.maintenance.status"
+    fi
+ 
+    if [[ "$CUR_CLUSTER_STATUS" == "ACTIVE" ||  "$CUR_CLUSTER_STATUS" == "PASSIVE" ||  "$CUR_CLUSTER_STATUS" == "STANDALONE" ]] ; then
+        print_msg " -> Scheduling background Hetzner data sync for next boot..."
+        echo '#!/bin/bash' > "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo '# Wait for DNS and basic routing to initialize' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo 'until ping -c 1 8.8.8.8 >/dev/null 2>&1; do sleep 5; done' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo 'sleep 30' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo 'if [ -f "/root/bin/int.hetzner" ] && [ -d "/var/qmail/mailnames" ]; then' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo '    /root/bin/int.hetzner -q sync-mail-back' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo '    /root/bin/int.mailserver repair full' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo 'fi' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo 'if [ -f "/root/bin/int.hetzner" ] && [ -d "/var/www/vhosts/sidium.docpile.de/apps/no-hosting" ]; then' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo '    FREE_GB=$(df --output=avail -BG / | tail -1 | tr -dc "0-9")' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo '    if [ -n "$FREE_GB" ] && [ "$FREE_GB" -gt 400 ]; then' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo '        /root/bin/int.hetzner -q sync-back-cloud' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo '        /root/bin/int.webserver fix-perms' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo '    fi' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo 'fi' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo 'systemctl disable hetzner-sync-once.service >/dev/null 2>&1' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo 'rm -f /etc/systemd/system/hetzner-sync-once.service' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo 'rm -f "$0"' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        chmod +x "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        
+        echo '[Unit]' > "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        echo 'Description=One-time Hetzner Data Sync' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        echo 'After=network-online.target' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        echo 'Wants=network-online.target' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        echo '' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        echo '[Service]' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        echo 'Type=simple' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        echo 'ExecStart=/usr/local/bin/hetzner-sync-once.sh' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        echo '' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        echo '[Install]' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        echo 'WantedBy=multi-user.target' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        mkdir -p "$stage_dir/etc/systemd/system/multi-user.target.wants"
+        ln -sf /etc/systemd/system/hetzner-sync-once.service "$stage_dir/etc/systemd/system/multi-user.target.wants/hetzner-sync-once.service"
+    fi
+
+
+    # ==============================================================================
+    # THE CHROOT SANDBOX: Firmware, Initramfs & GRUB Adjustments
+    # ==============================================================================
+    print_msg "Preparing chroot sandbox for safe bootloader update..."
+
+    mount --bind /dev "$stage_dir/dev"
+    mount --bind /dev/pts "$stage_dir/dev/pts"
+    mount --bind /proc "$stage_dir/proc"
+    mount --bind /sys "$stage_dir/sys"
+    mount --bind /run "$stage_dir/run"
+
+    if [ -e "$stage_dir/etc/resolv.conf" ] || [ -L "$stage_dir/etc/resolv.conf" ]; then
+        mv "$stage_dir/etc/resolv.conf" "$stage_dir/etc/resolv.conf.borgbak"
+    fi
+    cp /etc/resolv.conf "$stage_dir/etc/resolv.conf"
+
+    # ==============================================================================
+    # PRE-SYNC: Dedicated /boot Partition Mapping
+    # ==============================================================================
+    if mountpoint -q /boot; then
+        print_msg "[Chroot] Dedicated /boot partition detected. Pre-syncing to resolve GRUB paths..."
+        mv "$stage_dir/boot" "$stage_dir/boot_extracted"
+        mkdir -p "$stage_dir/boot"
+        
+        mount --bind /boot "$stage_dir/boot"
+        
+        # Sync extracted kernels into the physical partition early, protecting EFI/lost+found
+        rsync -aAX --exclude="efi" --exclude="lost+found" --delete "$stage_dir/boot_extracted/" "$stage_dir/boot/"
+        
+        # Prevent final rsync from wiping the physical boot partition or copying the temp folder
+        CONF_EXCLUDES+=("--exclude=/boot/*" "--exclude=/boot_extracted")
+    fi
+
+    local grub_success=false
+
+    if [ -d "/sys/firmware/efi" ]; then
+        print_msg "[Chroot] Target is UEFI. Updating Bootloader configuration..."
+        mkdir -p "$stage_dir/boot/efi"
+        mount --bind /boot/efi "$stage_dir/boot/efi" 2>/dev/null || mount /dev/disk/by-uuid/$live_efi_uuid "$stage_dir/boot/efi"
+        
+        if chroot "$stage_dir" /bin/bash -c "update-initramfs -u -k all && update-grub"; then
+            grub_success=true
+        fi
+        umount "$stage_dir/boot/efi" || true
+    else
+        print_msg "[Chroot] Target is BIOS. Updating Bootloader configuration..."
+        if chroot "$stage_dir" /bin/bash -c "update-initramfs -u -k all && update-grub"; then
+            grub_success=true
+        fi
+    fi
+
+    print_msg "Tearing down chroot sandbox..."
+    if mountpoint -q "$stage_dir/boot"; then
+        umount "$stage_dir/boot" || true
+    fi
+    rm -f "$stage_dir/etc/resolv.conf"
+    if [ -e "$stage_dir/etc/resolv.conf.borgbak" ] || [ -L "$stage_dir/etc/resolv.conf.borgbak" ]; then
+        mv "$stage_dir/etc/resolv.conf.borgbak" "$stage_dir/etc/resolv.conf"
+    fi
+
+    umount "$stage_dir/run"
+    umount "$stage_dir/sys"
+    umount "$stage_dir/proc"
+    umount "$stage_dir/dev/pts"
+    umount "$stage_dir/dev"
+
+    if [ "$grub_success" = false ]; then
+        print_msg "CRITICAL ERROR: Bootloader compilation failed inside the staging area."
+        echo "Because we caught this BEFORE the Rsync phase, your live system is completely untouched."
+        echo "Please check the staging area or logs to determine why update-grub failed."
+        die "Aborting kamikaze restore to prevent bricking the server."
+    fi
+
+    # ==============================================================================
+    # LIVE OVERWRITE & KAMIKAZE REBOOT
+    # ==============================================================================
+
+    print_msg "Stopping active daemons to release file locks..."
+    local keep_alive_regex='(ssh|sshd|systemd|network|NetworkManager|dbus|chrony|systemd-journald|polkit)'
+
+    # Stop active sockets first to prevent socket-activation from respawning daemons mid-restore
+    local sockets_to_stop=$(systemctl list-units --type=socket --state=active --no-legend | awk '{print $1}' | grep -vE "$keep_alive_regex" || true)
+    if [ -n "$sockets_to_stop" ]; then
+        for sock in $sockets_to_stop; do
+            systemctl stop "$sock" || true
+        done
+    fi
+
+    local services_to_stop=$(systemctl list-units --type=service --state=running --no-legend | awk '{print $1}' | grep -vE "$keep_alive_regex" || true)
+    if [ -n "$services_to_stop" ]; then
+        for svc in $services_to_stop; do
+            systemctl stop "$svc" || true
+        done
+    fi
+
+    print_msg "Executing live filesystem swap via Rsync..."
+    rsync -aAXSH --info=progress2 --numeric-ids --delete \
+        "${CONF_EXCLUDES[@]:-}" \
+        "$stage_dir/" /
+
+    # ==============================================================================
+    # MANDATORY POST-SYNC BOOT REPAIR
+    # ==============================================================================
+    print_msg "Sync complete. Reinstalling GRUB on live filesystem (Detecting Firmware)..."
+    local root_disk
+    root_disk=$(lsblk -no pkname "$(findmnt -n -o SOURCE /)" | head -n1)
+
+    if [ -z "$root_disk" ]; then
+        local root_part=$(findmnt -n -o SOURCE /)
+        root_disk=$(echo "$root_part" | sed -r 's/p?[0-9]+$//' | sed 's|^/dev/||')
+    fi
+
+    local live_grub_success=false
+    if [ -d "/sys/firmware/efi" ]; then
+        print_msg "UEFI boot detected. Installing GRUB for x86_64-efi..."
+        if ! mountpoint -q /boot/efi; then
+            mount /boot/efi || echo "[WARNING] Failed to mount /boot/efi."
+        fi
+        if grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable --recheck && update-grub; then
+            live_grub_success=true
+        fi
+    else
+        print_msg "Legacy BIOS detected. Installing GRUB to MBR of /dev/$root_disk..."
+        if [ -n "$root_disk" ]; then
+            if grub-install "/dev/$root_disk" --target=i386-pc --recheck && update-grub; then
+                live_grub_success=true
+            fi
+        fi
+    fi
+
+    if [ "$live_grub_success" = false ]; then
+        print_msg "CRITICAL ERROR: Bootloader installation failed after Rsync."
+        echo "DO NOT REBOOT. You are currently in a volatile state and the system will NOT boot."
+        echo "Please manually run 'grub-install /dev/sdX' and 'update-grub' right now."
+        die "Aborting kamikaze reboot to prevent bricking the server."
+    fi
+
+    print_msg "Purging volatile staging area to reclaim disk space..."
+    rm -rf "${stage_dir:?}"
+
+    print_msg "Restore finished. Initiating forced kernel reboot..."
+
+    echo "Saving execution log to persistent storage before boot..."
+    mkdir -p /var/log/borg_kamikaze
+    cp "$log_file" "/var/log/borg_kamikaze/restore_$(date +%Y%m%d_%H%M%S).log"
+    sync
+
+    echo "Clearing disk cache (and waiting to settle)..."
+    sync; sync; sync
+    echo 1 > /proc/sys/kernel/sysrq
+    echo s > /proc/sysrq-trigger
+    sleep 3
+
+    echo "Remounting filesystems as read-only..."
+    echo "Good-bye. Hopefully see you after reboot!"
+
+    echo u > /proc/sysrq-trigger
+    sleep 3
+    echo b > /proc/sysrq-trigger
+
+
+    } < /dev/null >> "$log_file" 2>&1 &
+
+    local bg_pid=$!
+    disown "$bg_pid" # Remove from shell job control to prevent HUP cascade
+
+    # Stream the logs to the user until the background process finishes (or the system reboots)
+    tail -f "$log_file" --pid="$bg_pid" || true
+}
+
+
+do_delete() {
+    setup_ssh_connection
+    sync_borg_version
+    
+    # 1. Allow the user to target any machine's repository
+    select_repository
+
+    # 2. Allow the user to pick the exact archive to delete
+    local archive="${2:-}"
+    if [ -z "$archive" ]; then
+        archive=$(select_archive)
+    fi
+
+    # Strip hidden carriage returns/whitespaces
+    archive=$(echo -n "$archive" | tr -d '\r' | xargs)
+
+    if [ -z "$archive" ]; then
+        die "Archive selection resulted in an empty string. Aborting."
+    fi
+
+    # 3. Hard Confirmation
+    print_msg "WARNING: ARCHIVE DELETION INITIATED"
+    echo "Target Repository: $BORG_REPO"
+    echo "Target Archive: $archive"
+    echo "This action is IRREVERSIBLE. The data will be permanently deleted."
+    read -p "Are you absolutely sure you want to delete this archive? (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        die "Aborted."
+    fi
+
+    # 4. Deletion and Compaction
+    print_msg "Deleting archive: $archive..."
+    borg delete --stats --show-rc ::"$archive"
+    
+    if [ $? -eq 0 ]; then
+        print_msg "Archive deleted successfully. Compacting repository to free physical disk space..."
+        borg compact --show-rc
+    else
+        die "Failed to delete archive '$archive'."
+    fi
+}
+
+check_self_update() {
+	echo " "
+    local repo_target="${CONF_REPO#*://}"
+    repo_target="${repo_target%%/*}"
+    local borg_port="${repo_target##*:}"
+    local auth_host="${repo_target%:*}"
+    
+    local ssh_user
+    local ssh_host
+    if [[ "$auth_host" == *"@"* ]]; then
+        ssh_user="${auth_host%%@*}"
+        ssh_host="${auth_host#*@}"
+    else
+        ssh_host="$auth_host"
+        ssh_user="${ssh_host%%.*}"
+    fi
+
+    local remote_full_path="${CONF_REPO#*./}"
+    local remote_base_dir=$(dirname "$remote_full_path")
+    local remote_script_path="${remote_base_dir}/${script_name}"
+
+    # Use rsync to check if remote is newer and needs downloading (-t preserves time, -u skips if local is newer)
+    local needs_update
+    needs_update=$(rsync -ic --dry-run -e "ssh -p $borg_port -i $CONF_SSH_KEY -o StrictHostKeyChecking=accept-new -o BatchMode=yes -q" "${ssh_user}@${ssh_host}:${remote_script_path}" "$0" 2>/dev/null || true)
+	
+    if [ -n "$needs_update" ]; then
+        echo "Newer script version detected on Hetzner. Self-updating..."
+        local tmp_script="/tmp/borg_master_update_$$.sh"
+        
+        # Download to temp file to prevent executing a half-written script
+        if rsync -t -e "ssh -p $borg_port -i $CONF_SSH_KEY -q" "${ssh_user}@${ssh_host}:${remote_script_path}" "$tmp_script" 2>/dev/null; then
+            if bash -n "$tmp_script"; then
+                cat "$tmp_script" > "$0"
+                touch -r "$tmp_script" "$0" # Sync timestamp exactly
+                chmod +x "$0"
+                rm -f "$tmp_script"
+                echo "Self-update complete. Restarting action with the new script..."
+                exec "$0" "$@"
+            else
+                echo "Downloaded script failed syntax check! Aborting update."
+                rm -f "$tmp_script"
+            fi
+        else
+            print_msg "Failed to download the update. Proceeding with current local version."
+            rm -f "$tmp_script"
+        fi
+    else
+            print_msg "Update check did not find a newer version."
+    fi
+}
+
+if [ "${1:-}" != "install" ] && [ -n "${1:-}" ]; then
+    check_self_update "$@"
+fi
+
+# ==============================================================================
+# ROUTER
+# ==============================================================================
+case "${1:-}" in
+    install)      do_install ;;
+    backup)       do_backup "${2:-}" ;;
+    check)        do_check ;;
+    delete)       do_delete "$@" ;;
+    list)         do_list ;;
+    housekeeping) do_housekeeping ;;
+    restore-file) do_restore_file "$@" ;;
+    restore-live) do_restore_live "$@" ;;
+    *)
+        echo "Usage: $0 install"
+		echo "       $0 backup [\"comment\"]"
+        echo "       $0 check"
+        echo "       $0 delete"
+        echo "       $0 list"
+        echo "       $0 housekeeping"
+        echo "       $0 restore-file"
+        echo "       $0 restore-live"
+		echo " "
+        exit 1
+        ;;
+esac
+echo " "

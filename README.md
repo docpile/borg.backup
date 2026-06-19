@@ -1,7 +1,7 @@
 # borg.backup
 Borg backup script to automate backups/restores using a Hetzner Storage Box
 
-It was thoroughly tested in Ubuntu.
+It was written for and thoroughly tested on Ubuntu. Other distributions have not been tested and at least non-apt-based ones surely will not work. But of course, you can fork this and adapt it to other distros as well.
 
 Installation:
 1. Copy the script and its config file to the server(s)

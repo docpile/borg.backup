@@ -1,5 +1,5 @@
 # borg.backup
-Borg backup script to automate backups/restores for Hetzner storage
+Borg backup script to automate backups/restores using a Hetzner Storage Box
 
 It was thoroughly tested in Ubuntu.
 

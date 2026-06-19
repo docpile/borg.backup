@@ -1016,6 +1016,9 @@ do_restore_live() {
         die "Aborting kamikaze reboot to prevent bricking the server."
     fi
 
+    print_msg "Unlocking immutable files in staging area for a later deletion..."
+    chattr -R -i -a "${stage_dir:?}/" 2>/dev/null || true
+
     print_msg "Purging volatile staging area to reclaim disk space..."
     rm -rf "${stage_dir:?}"
 

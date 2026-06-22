@@ -17,7 +17,7 @@ CONFIG_FILE="$SCRIPT_DIR/int.backup.borg.config"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo -e "\n[FATAL ERROR] Configuration file missing: $CONFIG_FILE"
-    echo "Please create 'int.backup.borg.config' in the script directory."
+    echo "Please create and set up $0.config in the script directory."
     exit 1
 fi
 
@@ -56,6 +56,60 @@ script_name="${0##*/}"
 
 print_msg() { echo -e "\n=============================================================================\n[$(date '+%Y-%m-%d %H:%M:%S')] => $1 \n"; }
 die() { echo -e "\n[FATAL ERROR] $1" >&2; exit 1; }
+
+cleanup_temp_swap() {
+    if [ -n "${BORG_TMP_SWAP:-}" ] && [ -f "$BORG_TMP_SWAP" ]; then
+        echo -e "\n[INFO] Removing temporary swap file..."
+        swapoff "$BORG_TMP_SWAP" 2>/dev/null || true
+        rm -f "$BORG_TMP_SWAP"
+        unset BORG_TMP_SWAP
+    fi
+}
+trap cleanup_temp_swap EXIT
+
+setup_temp_swap() {
+    local mem_avail
+    mem_avail=$(free -m | awk '/^Mem:/{print $7}')
+    local swap_free
+    swap_free=$(free -m | awk '/^Swap:/{print $4}')
+    local total_headroom=$((mem_avail + swap_free))
+    
+    if [ "$total_headroom" -lt 8192 ]; then
+        print_msg "Low memory headroom detected (${total_headroom}MB). Verifying disk space for temporary swap..."
+        local free_space_mb
+        free_space_mb=$(df -m /var/tmp | awk 'NR==2 {print $4}')
+        
+        # Require at least 1GB (1024MB) to remain free on the disk after swap creation
+        local disk_buffer_mb=1024
+        local max_swap_mb=8192
+        local available_for_swap_mb=$((free_space_mb - disk_buffer_mb))
+        
+        if [ "$available_for_swap_mb" -ge 1024 ]; then
+            local actual_swap_mb="$max_swap_mb"
+            if [ "$available_for_swap_mb" -lt "$max_swap_mb" ]; then
+                actual_swap_mb="$available_for_swap_mb"
+            fi
+            
+            print_msg "Creating ${actual_swap_mb}MB temporary swap file to prevent Borg OOM (Exit Code 137)..."
+            export BORG_TMP_SWAP="/var/tmp/borg_tmp_swap_$(date +%s).img"
+            if fallocate -l "${actual_swap_mb}M" "$BORG_TMP_SWAP" 2>/dev/null || dd if=/dev/zero of="$BORG_TMP_SWAP" bs=1M count="$actual_swap_mb" status=none; then
+                chmod 600 "$BORG_TMP_SWAP"
+                mkswap "$BORG_TMP_SWAP" >/dev/null 2>&1
+                swapon "$BORG_TMP_SWAP" 2>/dev/null
+                print_msg "Temporary swap active (${actual_swap_mb}MB)."
+            else
+                print_msg "[WARNING] Failed to initialize temporary swap. Backup may fail."
+                rm -f "$BORG_TMP_SWAP" 2>/dev/null
+                unset BORG_TMP_SWAP
+            fi
+        else
+            print_msg "[WARNING] Insufficient free space on /var/tmp (${free_space_mb}MB) for even a minimal 1GB swap. Skipping..."
+        fi
+    else
+        print_msg "Memory headroom sufficient (${total_headroom}MB). No temporary swap needed."
+    fi
+}
+
 
 sync_borg_version() {
     if command -v borg >/dev/null 2>&1; then
@@ -364,6 +418,13 @@ do_backup() {
         fi
     fi
 
+    # Trigger memory protection before the heavy caching phase
+    setup_temp_swap
+
+    if [ -n "${BORG_TMP_SWAP:-}" ]; then
+        CONF_EXCLUDES+=(--exclude "$BORG_TMP_SWAP")
+    fi
+
     local archive_name="${CONF_ARCHIVE_PREFIX}$(date '+%Y-%m-%d-%H%M')"
 
     local borg_opts=(
@@ -401,6 +462,7 @@ do_backup() {
         die "Backup failed with exit code $backup_exit"
     fi
 }
+
 
 do_check() {
     sync_borg_version

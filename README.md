@@ -20,7 +20,7 @@ However, up to now it was only thoroughly tested on Ubuntu.
 
 ## **Updating:**
 1. Edit or replace the file on the server or USB drive borg repo.
-2. The script will auto-update on its next run.
+2. The script will auto-update the machine(s) on its next run.
 
 ## **Backup:**
 1. Run "borg.backup backup"

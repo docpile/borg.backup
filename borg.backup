@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# BORG BARE-METAL MASTER SCRIPT (Multi-Distro Edition)
+# BORG BARE-METAL MASTER SCRIPT
 # ==============================================================================
 # Mission: 1:1 System Backups to Hetzner Storage Box & LIVE Bare-Metal Recovery
 # Architecture: 2-File Fire & Forget (Config + Script). Keys Vaulted on Hetzner.
-# Compatibility: Ubuntu/Debian, RHEL/Alma/Rocky, Arch, SUSE
 # ==============================================================================
 
 set -u
@@ -23,12 +22,17 @@ fi
 
 source "$CONFIG_FILE"
 
-# Auto-correct missing Hetzner Username in CONF_REPO
-if [[ "$CONF_REPO" == ssh://* ]] && [[ ! "$CONF_REPO" == *"@"* ]]; then
-    raw_target="${CONF_REPO#ssh://}"
-    raw_host="${raw_target%%:*}"
-    raw_user="${raw_host%%.*}"
-    CONF_REPO="ssh://${raw_user}@${raw_target}"
+# Set default mode to ssh if not explicitly defined in an older config
+CONF_TARGET_MODE="${CONF_TARGET_MODE:-ssh}"
+
+# Auto-correct missing Hetzner Username in CONF_REPO (Only for SSH mode)
+if [ "$CONF_TARGET_MODE" = "ssh" ]; then
+    if [[ "$CONF_REPO" == ssh://* ]] && [[ ! "$CONF_REPO" == *"@"* ]]; then
+        raw_target="${CONF_REPO#ssh://}"
+        raw_host="${raw_target%%:*}"
+        raw_user="${raw_host%%.*}"
+        CONF_REPO="ssh://${raw_user}@${raw_target}"
+    fi
 fi
 
 # ==============================================================================
@@ -36,84 +40,17 @@ fi
 # ==============================================================================
 export BORG_REPO="$CONF_REPO"
 export BORG_PASSPHRASE="$CONF_PASSPHRASE"
-export BORG_RSH="ssh -i $CONF_SSH_KEY -p 23 -o StrictHostKeyChecking=accept-new"
+
+if [ "$CONF_TARGET_MODE" = "ssh" ]; then
+    export BORG_RSH="ssh -i $CONF_SSH_KEY -p 23 -o StrictHostKeyChecking=accept-new"
+else
+    export BORG_RSH="" # Not needed for local mounts
+fi
 
 script_name="${0##*/}"
 
 # ==============================================================================
-# FUNCTIONS: DISTRO ABSTRACTION
-# ==============================================================================
-
-pkg_install() {
-    local pkgs=("$@")
-    if command -v apt-get >/dev/null 2>&1; then
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq && apt-get install -yqq "${pkgs[@]}"
-    elif command -v dnf >/dev/null 2>&1; then
-        local dnf_pkgs=()
-        for p in "${pkgs[@]}"; do
-            [[ "$p" == "openssh-client" ]] && p="openssh-clients"
-            [[ "$p" == "mariadb-client" ]] && p="mariadb"
-            dnf_pkgs+=("$p")
-        done
-        dnf install -y -q "${dnf_pkgs[@]}"
-    elif command -v yum >/dev/null 2>&1; then
-        local yum_pkgs=()
-        for p in "${pkgs[@]}"; do
-            [[ "$p" == "openssh-client" ]] && p="openssh-clients"
-            [[ "$p" == "mariadb-client" ]] && p="mariadb"
-            yum_pkgs+=("$p")
-        done
-        yum install -y -q "${yum_pkgs[@]}"
-    elif command -v pacman >/dev/null 2>&1; then
-        local pac_pkgs=()
-        for p in "${pkgs[@]}"; do
-            [[ "$p" == "mariadb-client" ]] && p="mariadb-clients"
-            pac_pkgs+=("$p")
-        done
-        pacman -Sy --noconfirm --needed "${pac_pkgs[@]}"
-    elif command -v zypper >/dev/null 2>&1; then
-        local zyp_pkgs=()
-        for p in "${pkgs[@]}"; do
-            [[ "$p" == "openssh-client" ]] && p="openssh-clients"
-            [[ "$p" == "mariadb-client" ]] && p="mariadb-client"
-            zyp_pkgs+=("$p")
-        done
-        zypper --non-interactive install "${zyp_pkgs[@]}"
-    else
-        die "Unsupported package manager. Please manually install: ${pkgs[*]}"
-    fi
-}
-
-get_pkg_update_cmd() {
-    if command -v apt-get >/dev/null 2>&1; then
-        echo "export DEBIAN_FRONTEND=noninteractive; dpkg --configure -a; apt-get update -qq; apt-get upgrade -yqq; apt-get autoremove -yqq"
-    elif command -v dnf >/dev/null 2>&1; then
-        echo "dnf upgrade -y -q; dnf autoremove -y -q"
-    elif command -v pacman >/dev/null 2>&1; then
-        echo "pacman -Syu --noconfirm"
-    elif command -v zypper >/dev/null 2>&1; then
-        echo "zypper --non-interactive update"
-    else
-        echo "echo 'Manual update required.'"
-    fi
-}
-
-get_microcode_pkg() {
-    local vendor="$1"
-    if command -v apt-get >/dev/null 2>&1; then
-        [ "$vendor" = "GenuineIntel" ] && echo "intel-microcode" || echo "amd64-microcode"
-    elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1 || command -v zypper >/dev/null 2>&1; then
-        echo "microcode_ctl"
-    elif command -v pacman >/dev/null 2>&1; then
-        [ "$vendor" = "GenuineIntel" ] && echo "intel-ucode" || echo "amd-ucode"
-    else
-        echo ""
-    fi
-}
-
-# ==============================================================================
-# FUNCTIONS: CORE LOGIC
+# FUNCTIONS
 # ==============================================================================
 
 print_msg() { echo -e "\n=============================================================================\n[$(date '+%Y-%m-%d %H:%M:%S')] => $1 \n"; }
@@ -130,6 +67,10 @@ sync_borg_version() {
 }
 
 setup_ssh_connection() {
+    if [ "$CONF_TARGET_MODE" = "local" ]; then
+        return 0
+    fi
+
     print_msg "Verifying/Configuring SSH Key Authentication"
 
     local ssh_dir
@@ -156,7 +97,8 @@ setup_ssh_connection() {
     # Ensure sshpass is installed immediately to interact with the Hetzner Vault
     if ! command -v sshpass >/dev/null 2>&1; then
         print_msg "sshpass not found. Installing dynamically..."
-        pkg_install sshpass
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq && apt-get install -yqq sshpass
     fi
 
     local vault_path=".ssh/vault_${CONF_MACHINE_NAME}_id"
@@ -234,6 +176,11 @@ setup_ssh_connection() {
 }
 
 do_housekeeping() {
+    if [ "$CONF_TARGET_MODE" = "local" ]; then
+        print_msg "Housekeeping is not required for local storage mode."
+        return 0
+    fi
+
     print_msg "Starting Global SSH Key Housekeeping on Hetzner"
     setup_ssh_connection
     
@@ -300,8 +247,51 @@ do_housekeeping() {
 }
 
 do_install() {
+    if [ "$CONF_TARGET_MODE" = "local" ]; then
+        print_msg "Installing requirements (Borg, MariaDB-Client, Rsync)"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq && apt-get install -yqq borgbackup mariadb-client rsync
+
+        sync_borg_version
+
+        print_msg "Preparing local directory structure"
+        mkdir -p "$CONF_LOCAL_REPO_BASE"
+
+        local remote_script_path="${CONF_LOCAL_REPO_BASE}/${script_name}"
+
+        print_msg "Checking master script status on Local Storage..."
+        if [ ! -f "$remote_script_path" ]; then
+            echo " -> Master script is missing on local storage. Seeding now..."
+            cp "$0" "$remote_script_path"
+            chmod +x "$remote_script_path"
+            echo " -> Success: Master script copied to local storage."
+        else
+            if ! cmp -s "$0" "$remote_script_path"; then
+                echo " -> Master script exists, but your LOCAL version is different."
+                read -p "Do you want to update the master version on local storage? (y/N) " -n 1 -r
+                echo
+                if [[ $REPLY =~ ^[Yy]$ ]]; then
+                    cp "$0" "$remote_script_path"
+                    chmod +x "$remote_script_path"
+                    echo " -> Success: Master script updated on local storage."
+                else
+                    echo " -> Skipped: User aborted update."
+                fi
+            else
+                echo " -> Skipped: Master script already exists and is up to date."
+            fi
+        fi
+        
+        print_msg "Attempting to initialize the Borg repository at $CONF_REPO..."
+        borg init --encryption=repokey || echo "Repository may already be initialized. Skipping."
+        print_msg "Install routine finished."
+        return
+    fi
+
+    # SSH Installation Flow
     print_msg "Installing requirements \n(Borg, Openssh-Client, MariaDB-Client, Rsync, SshPass)"
-    pkg_install borgbackup openssh-client mariadb-client rsync sshpass
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq && apt-get install -yqq borgbackup openssh-client mariadb-client rsync sshpass
 
     setup_ssh_connection
     sync_borg_version
@@ -362,7 +352,7 @@ do_backup() {
     sync_borg_version
     print_msg "Starting Full System Backup for $CONF_MACHINE_NAME (Using: ${BORG_REMOTE_PATH:-default})"
 
-    if [ "${CONF_DUMP_DB:-false}" = true ]; then
+    if [ "$CONF_DUMP_DB" = true ]; then
         if command -v mysqldump >/dev/null 2>&1 && mysqladmin ping >/dev/null 2>&1; then
             print_msg "Dumping databases for consistency"
             mkdir -p "$CONF_DB_DUMP_DIR"
@@ -423,7 +413,58 @@ do_list() {
     borg list --format "{archive:<36} {time} {comment}{NL}" --show-rc
 }
 
+
 select_repository() {
+    if [ "$CONF_TARGET_MODE" = "local" ]; then
+        print_msg "Fetching available repositories from Local Storage..." >&2
+        
+        if [ ! -d "$CONF_LOCAL_REPO_BASE" ]; then
+            echo "Local base directory does not exist. Using default config repository." >&2
+            return
+        fi
+
+        mapfile -t repo_list < <(ls -1 "$CONF_LOCAL_REPO_BASE" 2>/dev/null | grep -v "^${script_name}$")
+
+        if [ ${#repo_list[@]} -eq 0 ]; then
+            echo "Could not auto-detect repositories. Using default config repository." >&2
+            return
+        fi
+
+        echo "" >&2
+        echo "========================================================" >&2
+        echo "                 AVAILABLE REPOSITORIES" >&2
+        echo "========================================================" >&2
+        local current_idx=1
+        for i in "${!repo_list[@]}"; do
+            local marker=" "
+            local repo_url="${CONF_LOCAL_REPO_BASE}/${repo_list[$i]}"
+            if [ "$repo_url" = "$CONF_REPO" ]; then
+                marker="*"
+                current_idx=$((i+1))
+            fi
+            printf " %s%2d) %s\n" "$marker" "$((i+1))" "${repo_list[$i]}" >&2
+        done
+        echo "========================================================" >&2
+        echo " * = Current default (from config)" >&2
+        echo "" >&2
+
+        local selection
+        read -p "Select the repository to use (1-${#repo_list[@]}) [Default: $current_idx]: " selection >&2
+
+        if [ -z "$selection" ]; then
+            selection=$current_idx
+        fi
+
+        if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "${#repo_list[@]}" ]; then
+            echo "Invalid selection. Proceeding with default repository." >&2
+        else
+            export BORG_REPO="${CONF_LOCAL_REPO_BASE}/${repo_list[$((selection-1))]}"
+            echo " -> Active Repository set to: $BORG_REPO" >&2
+        fi
+        return
+    fi
+
+    # SSH Repo Selection Logic
     print_msg "Fetching available repositories from Hetzner..." >&2
     
     local repo_target="${CONF_REPO#*://}"
@@ -486,7 +527,7 @@ select_repository() {
 }
 
 select_archive() {
-    print_msg "Fetching available backups from Hetzner..." >&2
+    print_msg "Fetching available backups..." >&2
     
     # Use formatted output for the visual menu so comments are visible
     mapfile -t full_list < <(borg list --format "{archive:<36} {time} {comment}{NL}" 2>/dev/null)
@@ -533,12 +574,151 @@ do_restore_file() {
         read -p "Enter the absolute path of the file/directory to restore (e.g., /etc/fstab): " target_path
     fi
     
-    local restore_dir="/tmp/borg_restore_$(date +%s)"
-    mkdir -p "$restore_dir"
-    cd "$restore_dir" || die "Cannot cd to $restore_dir"
+    # Normalize path (remove trailing slash, strip leading slash for borg)
+    target_path="${target_path%/}"
+    local clean_target="${target_path#/}"
+    local target_basename=$(basename "$target_path")
+    local target_dirname=$(dirname "$clean_target")
     
-    print_msg "Restoring $target_path from $archive to $restore_dir"
-    borg extract --list ::"$archive" "${target_path#/}" || die "File extraction failed! Aborting."
+    local current_invocation_dir="$PWD"
+    local restore_dir=""
+    local path_mode="full" # Default
+
+    echo "" >&2
+    echo "========================================================" >&2
+    echo "                 RESTORE DESTINATION" >&2
+    echo "========================================================" >&2
+    echo " 1) Original location (/)" >&2
+    echo " 2) Temporary directory (/tmp/borg_restore_...)" >&2
+    echo " 3) Current directory ($current_invocation_dir)" >&2
+    echo " 4) Alternate directory" >&2
+    echo "========================================================" >&2
+    echo "" >&2
+
+    local dest_selection
+    read -p "Select the restore destination (1-4): " dest_selection >&2
+
+    case "$dest_selection" in
+        1)
+            restore_dir="/"
+            ;;
+        2)
+            restore_dir="/tmp/borg_restore_$(date +%s)"
+            ;;
+        3)
+            restore_dir="$current_invocation_dir"
+            ;;
+        4)
+            read -p "Enter the absolute path to the alternate directory: " restore_dir >&2
+            if [ -z "$restore_dir" ]; then
+                die "No alternate directory provided. Aborting."
+            fi
+            ;;
+        *)
+            die "Invalid selection. Aborting."
+            ;;
+    esac
+    
+    local borg_opts=("--list")
+    
+    # Ask for Path Structure if restoring to a custom location
+    if [ "$dest_selection" = "3" ] || [ "$dest_selection" = "4" ]; then
+        echo "" >&2
+        echo "Path Structure:" >&2
+        echo " [F]ull path   (e.g., restores as $restore_dir/$clean_target)" >&2
+        echo " [O]nly item   (e.g., restores as $restore_dir/$target_basename)" >&2
+        read -p "Keep full path or extract only the item? [F/o]: " struct_selection >&2
+        
+        if [[ "$struct_selection" =~ ^[Oo]$ ]]; then
+            path_mode="stripped"
+            # Calculate how many directories to strip from the archive path
+            if [ "$target_dirname" != "." ]; then
+                local strip_count=$(echo "$target_dirname" | awk -F/ '{print NF}')
+                borg_opts+=("--strip-components" "$strip_count")
+            fi
+        fi
+    fi
+
+    # Determine the anticipated final path on disk
+    local dest_rel_path="$clean_target"
+    if [ "$path_mode" = "stripped" ]; then
+        dest_rel_path="$target_basename"
+    fi
+    
+    local final_path="${restore_dir%/}/$dest_rel_path"
+    if [ "$restore_dir" = "/" ]; then
+        final_path="/$dest_rel_path"
+    fi
+
+    local use_staging=false
+
+    # Collision Check Loop
+    while [ -e "$final_path" ]; do
+        echo -e "\n[WARNING] The destination already exists: $final_path" >&2
+        read -p "Do you want to (O)verwrite/Merge, (R)ename restored item, or (A)bort? [o/R/a]: " collision_choice >&2
+        
+        # Default to Rename to prevent accidental destruction
+        if [ -z "$collision_choice" ]; then collision_choice="R"; fi
+        
+        if [[ "$collision_choice" =~ ^[Oo]$ ]]; then
+            echo " -> Proceeding. Borg will natively merge directories and overwrite files." >&2
+            break
+        elif [[ "$collision_choice" =~ ^[Aa]$ ]]; then
+            die "Restore aborted by user."
+        elif [[ "$collision_choice" =~ ^[Rr]$ ]]; then
+            read -p "Enter new name for the restored item (e.g., ${target_basename}_restored): " new_name >&2
+            if [ -n "$new_name" ]; then
+                use_staging=true
+                dest_rel_path="$(dirname "$dest_rel_path")/$new_name"
+                dest_rel_path="${dest_rel_path#./}" # Clean if dirname was .
+                
+                final_path="${restore_dir%/}/$dest_rel_path"
+                if [ "$restore_dir" = "/" ]; then
+                    final_path="/$dest_rel_path"
+                fi
+            else
+                echo "Name cannot be empty." >&2
+            fi
+        else
+            echo "Invalid choice." >&2
+        fi
+    done
+
+    # Execution Core
+    if [ "$use_staging" = true ]; then
+        # Use a local staging dir on the same disk so `mv` is instantaneous and atomic
+        local staging_dir="${restore_dir%/}/.borg_staging_$(date +%s)"
+        if [ "$restore_dir" = "/" ]; then staging_dir="/.borg_staging_$(date +%s)"; fi
+        
+        mkdir -p "$staging_dir" || die "Failed to create staging directory at $staging_dir"
+        cd "$staging_dir" || die "Cannot cd to $staging_dir"
+        
+        print_msg "Restoring $target_path (via staging) to $final_path"
+        borg extract "${borg_opts[@]}" ::"$archive" "$clean_target" || die "File extraction failed! Aborting."
+        
+        # Locate the item inside the staging area based on the structure chosen
+        local extracted_item="$staging_dir/$clean_target"
+        if [ "$path_mode" = "stripped" ]; then
+            extracted_item="$staging_dir/$target_basename"
+        fi
+        
+        mkdir -p "$(dirname "$final_path")"
+        mv "$extracted_item" "$final_path" || die "Failed to move restored item to final path."
+        
+        cd "$current_invocation_dir"
+        rm -rf "$staging_dir"
+    else
+        # Direct extraction (either no collision, or Overwrite/Merge was selected)
+        mkdir -p "$restore_dir"
+        cd "$restore_dir" || die "Cannot cd to $restore_dir"
+        
+        print_msg "Restoring $target_path directly to $final_path"
+        borg extract "${borg_opts[@]}" ::"$archive" "$clean_target" || die "File extraction failed! Aborting."
+        
+        cd "$current_invocation_dir"
+    fi
+
+    print_msg "Restore Complete. \n  => Available at: $final_path"
 }
 
 do_restore_live() {
@@ -589,7 +769,7 @@ do_restore_live() {
         trap '' HUP PIPE # Render this subshell immune to disconnects and broken pipes
 
     # 1. Break Stale Locks
-    print_msg "Clearing any stale Hetzner repository locks..."
+    print_msg "Clearing any stale repository locks..."
     borg break-lock || true
 
     # 2. Hardware State Capture
@@ -597,9 +777,9 @@ do_restore_live() {
     local safe_hw_dir="/tmp/safe_hw_config"
     mkdir -p "$safe_hw_dir"
     
-    if [ -d /etc/netplan ]; then cp -a /etc/netplan "$safe_hw_dir/"; fi
-    if [ -d /etc/NetworkManager/system-connections ]; then cp -a /etc/NetworkManager/system-connections "$safe_hw_dir/"; fi
-    if [ -d /etc/systemd/network ]; then cp -a /etc/systemd/network "$safe_hw_dir/"; fi
+    if [ -d /etc/netplan ]; then
+        cp -a /etc/netplan "$safe_hw_dir/"
+    fi
 
     # Capture LIVE Network State
     local live_iface=$(ip -4 route show default | awk '{print $5}' | head -n1)
@@ -666,6 +846,7 @@ do_restore_live() {
 
     # 1. FSTAB Patching
     if [ -f "$stage_dir/etc/fstab" ]; then
+        # Use awk to reliably target mount points regardless of how the source block device was named
         if [ -n "$live_root_uuid" ]; then
             awk -v uuid="UUID=$live_root_uuid" '(!/^#/ && $2 == "/") { $1=uuid } 1' "$stage_dir/etc/fstab" > "$stage_dir/etc/fstab.tmp" && mv "$stage_dir/etc/fstab.tmp" "$stage_dir/etc/fstab"
         fi
@@ -678,7 +859,7 @@ do_restore_live() {
             awk -v uuid="UUID=$live_efi_uuid" '(!/^#/ && $2 == "/boot/efi") { $1=uuid } 1' "$stage_dir/etc/fstab" > "$stage_dir/etc/fstab.tmp" && mv "$stage_dir/etc/fstab.tmp" "$stage_dir/etc/fstab"
         fi
         
-        # Handle Swap Partitions
+        # Handle Swap Partitions (Block Devices)
         if [ -n "$live_swap_uuid" ]; then
             awk -v uuid="UUID=$live_swap_uuid" '(!/^#/ && $3 == "swap" && $1 !~ /^\//) { $1=uuid } 1' "$stage_dir/etc/fstab" > "$stage_dir/etc/fstab.tmp" && mv "$stage_dir/etc/fstab.tmp" "$stage_dir/etc/fstab"
         else
@@ -695,33 +876,31 @@ do_restore_live() {
             mkswap "$stage_dir$swap_file" >/dev/null 2>&1 || true
         fi
         
-        # Add nofail to secondary mounts
+        # Add nofail to secondary non-critical mounts to prevent boot hangs if auxiliary drives are missing
         awk '(!/^#/ && $2 != "/" && $2 !~ /^\/boot/ && $3 != "swap") { if ($4 !~ /nofail/) $4=$4",nofail" } 1' "$stage_dir/etc/fstab" > "$stage_dir/etc/fstab.tmp" && mv "$stage_dir/etc/fstab.tmp" "$stage_dir/etc/fstab"
     fi
 
-    # 2. Network Patching (Netplan specifically, fallback available if required)
-    if [ -d "$stage_dir/etc/netplan" ]; then
-        local target_np=$(find "$stage_dir/etc/netplan" -type f -name "*.yaml" | head -n 1)
-        if [ -n "$target_np" ] && [ -n "$live_ip_cidr" ]; then
-            local old_gw=$(awk '/to: (0\.0\.0\.0\/0|default)/ {getline; print $2}' "$target_np" | tr -d '"'\''')
-            local old_ip_cidr=$(grep -E '^\s*- [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' "$target_np" | head -n1 | awk '{print $2}')
-            local old_ip="${old_ip_cidr%/*}"
+    # 2. Netplan Patching
+    local target_np=$(find "$stage_dir/etc/netplan" -type f -name "*.yaml" | head -n 1)
+    if [ -n "$target_np" ] && [ -n "$live_ip_cidr" ]; then
+        local old_gw=$(awk '/to: (0\.0\.0\.0\/0|default)/ {getline; print $2}' "$target_np" | tr -d '"'\''')
+        local old_ip_cidr=$(grep -E '^\s*- [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+' "$target_np" | head -n1 | awk '{print $2}')
+        local old_ip="${old_ip_cidr%/*}"
 
-            if [ -n "$old_ip_cidr" ]; then
-                sed -i -E "s|\\b${old_ip_cidr}\\b|${live_ip_cidr}|g" "$target_np"
-                sed -i -E "s|\\b${old_ip}\\b|${live_ip}|g" "$target_np"
-            fi
-            if [ -n "$old_gw" ] && [ -n "$live_gw" ]; then
-                sed -i -E "s|\\b${old_gw}\\b|${live_gw}|g" "$target_np"
-            fi
-            sed -i -E "s|addresses: \[[0-9\., ]+\]|addresses: [${live_dns}, 8.8.8.8]|g" "$target_np"
-            
-            if [ -n "$live_mac1" ] && [ -n "$live_iface" ]; then
-                awk -v iface="^[[:space:]]*${live_iface}:" -v mac="${live_mac1}" '$0 ~ iface { m=1 } m && /macaddress:/ { sub(/macaddress:.*/, "macaddress: " mac); m=0 } 1' "$target_np" > "${target_np}.tmp" && mv "${target_np}.tmp" "$target_np"
-            fi
-            if [ -n "$live_mac2" ] && [ -n "$live_iface_sec" ]; then
-                awk -v iface="^[[:space:]]*${live_iface_sec}:" -v mac="${live_mac2}" '$0 ~ iface { m=1 } m && /macaddress:/ { sub(/macaddress:.*/, "macaddress: " mac); m=0 } 1' "$target_np" > "${target_np}.tmp" && mv "${target_np}.tmp" "$target_np"
-            fi
+        if [ -n "$old_ip_cidr" ]; then
+            sed -i -E "s|\\b${old_ip_cidr}\\b|${live_ip_cidr}|g" "$target_np"
+            sed -i -E "s|\\b${old_ip}\\b|${live_ip}|g" "$target_np"
+        fi
+        if [ -n "$old_gw" ] && [ -n "$live_gw" ]; then
+            sed -i -E "s|\\b${old_gw}\\b|${live_gw}|g" "$target_np"
+        fi
+        sed -i -E "s|addresses: \[[0-9\., ]+\]|addresses: [${live_dns}, 8.8.8.8]|g" "$target_np"
+        
+        if [ -n "$live_mac1" ] && [ -n "$live_iface" ]; then
+            awk -v iface="^[[:space:]]*${live_iface}:" -v mac="${live_mac1}" '$0 ~ iface { m=1 } m && /macaddress:/ { sub(/macaddress:.*/, "macaddress: " mac); m=0 } 1' "$target_np" > "${target_np}.tmp" && mv "${target_np}.tmp" "$target_np"
+        fi
+        if [ -n "$live_mac2" ] && [ -n "$live_iface_sec" ]; then
+            awk -v iface="^[[:space:]]*${live_iface_sec}:" -v mac="${live_mac2}" '$0 ~ iface { m=1 } m && /macaddress:/ { sub(/macaddress:.*/, "macaddress: " mac); m=0 } 1' "$target_np" > "${target_np}.tmp" && mv "${target_np}.tmp" "$target_np"
         fi
     fi
 
@@ -731,27 +910,22 @@ do_restore_live() {
     rm -f "$stage_dir/etc/udev/rules.d/70-persistent-net.rules" 2>/dev/null || true
     rm -f "$stage_dir/etc/udev/rules.d/80-net-setup-link.rules" 2>/dev/null || true
 
-    # 4. CPU Microcode Alignment (OS-Agnostic mapping)
+    # 4. CPU Microcode Alignment
     local cpu_vendor=$(grep -m 1 'vendor_id' /proc/cpuinfo | awk '{print $3}')
-    local target_microcode=$(get_microcode_pkg "$cpu_vendor")
-    
+    local target_microcode=""
+    if [ "$cpu_vendor" = "GenuineIntel" ]; then
+        target_microcode="intel-microcode"
+    elif [ "$cpu_vendor" = "AuthenticAMD" ]; then
+        target_microcode="amd64-microcode"
+    fi
     if [ -n "$target_microcode" ]; then
         print_msg " -> Scheduling $target_microcode auto-install on next boot..."
         echo '#!/bin/bash' > "$stage_dir/usr/local/bin/install-microcode-once.sh"
-        echo '# Wait for routing' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
-        echo 'until ping -c 1 8.8.8.8 >/dev/null 2>&1; do sleep 5; done' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
-        echo "export DEBIAN_FRONTEND=noninteractive" >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
-        
-        if command -v apt-get >/dev/null 2>&1; then
-            echo "apt-get update -qq && apt-get install -yqq $target_microcode" >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
-        elif command -v dnf >/dev/null 2>&1; then
-            echo "dnf install -y -q $target_microcode" >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
-        elif command -v pacman >/dev/null 2>&1; then
-            echo "pacman -Sy --noconfirm $target_microcode" >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
-        elif command -v zypper >/dev/null 2>&1; then
-            echo "zypper --non-interactive install $target_microcode" >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
-        fi
-
+        echo '# Wait for DNS and basic routing to initialize' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo 'until ping -c 1 archive.ubuntu.com >/dev/null 2>&1; do sleep 5; done' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo 'export DEBIAN_FRONTEND=noninteractive' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo 'apt-get update -qq' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
+        echo "apt-get install -yqq $target_microcode" >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
         echo 'systemctl disable microcode-installer.service >/dev/null 2>&1' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
         echo 'rm -f /etc/systemd/system/microcode-installer.service' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
         echo 'rm -f "$0"' >> "$stage_dir/usr/local/bin/install-microcode-once.sh"
@@ -759,7 +933,7 @@ do_restore_live() {
         
         echo '[Unit]' > "$stage_dir/etc/systemd/system/microcode-installer.service"
         echo 'Description=One-time Hardware Microcode Installer' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
-        echo 'After=network-online.target' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
+        echo 'After=network-online.target systemd-resolved.service' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
         echo 'Wants=network-online.target' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
         echo '' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
         echo '[Service]' >> "$stage_dir/etc/systemd/system/microcode-installer.service"
@@ -780,8 +954,14 @@ do_restore_live() {
         local updater_service="$stage_dir/etc/systemd/system/post-restore-update-once.service"
         
         echo '#!/bin/bash' > "$updater_script"
-        echo 'until ping -c 1 8.8.8.8 >/dev/null 2>&1; do sleep 5; done' >> "$updater_script"
-        echo "$(get_pkg_update_cmd)" >> "$updater_script"
+        echo '# Wait for DNS and basic routing to initialize' >> "$updater_script"
+        echo 'until ping -c 1 archive.ubuntu.com >/dev/null 2>&1; do sleep 5; done' >> "$updater_script"
+        echo 'export DEBIAN_FRONTEND=noninteractive' >> "$updater_script"
+        echo 'dpkg --configure -a' >> "$updater_script" # Safety net for interrupted dpkg states
+        echo 'apt-get update -qq' >> "$updater_script"
+        echo 'apt-get upgrade -yqq' >> "$updater_script"
+        echo 'apt-get autoremove -yqq' >> "$updater_script"
+        echo '# Self-destruct sequence' >> "$updater_script"
         echo 'systemctl disable post-restore-update-once.service >/dev/null 2>&1' >> "$updater_script"
         echo 'rm -f /etc/systemd/system/post-restore-update-once.service' >> "$updater_script"
         echo 'rm -f "$0"' >> "$updater_script"
@@ -789,7 +969,7 @@ do_restore_live() {
         
         echo '[Unit]' > "$updater_service"
         echo 'Description=One-time Post-Restore System Update' >> "$updater_service"
-        echo 'After=network-online.target' >> "$updater_service"
+        echo 'After=network-online.target systemd-resolved.service' >> "$updater_service"
         echo 'Wants=network-online.target' >> "$updater_service"
         echo '' >> "$updater_service"
         echo '[Service]' >> "$updater_service"
@@ -818,8 +998,9 @@ do_restore_live() {
     fi
  
     if [[ "$CUR_CLUSTER_STATUS" == "ACTIVE" ||  "$CUR_CLUSTER_STATUS" == "PASSIVE" ||  "$CUR_CLUSTER_STATUS" == "STANDALONE" ]] ; then
-        print_msg " -> Scheduling background Hetzner data sync for next boot..."
+        print_msg " -> Scheduling background remote data sync for next boot..."
         echo '#!/bin/bash' > "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
+        echo '# Wait for DNS and basic routing to initialize' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
         echo 'until ping -c 1 8.8.8.8 >/dev/null 2>&1; do sleep 5; done' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
         echo 'sleep 30' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
         echo 'if [ -f "/root/bin/int.hetzner" ] && [ -d "/var/qmail/mailnames" ]; then' >> "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
@@ -839,7 +1020,7 @@ do_restore_live() {
         chmod +x "$stage_dir/usr/local/bin/hetzner-sync-once.sh"
         
         echo '[Unit]' > "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
-        echo 'Description=One-time Hetzner Data Sync' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
+        echo 'Description=One-time Data Sync' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
         echo 'After=network-online.target' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
         echo 'Wants=network-online.target' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
         echo '' >> "$stage_dir/etc/systemd/system/hetzner-sync-once.service"
@@ -852,6 +1033,7 @@ do_restore_live() {
         mkdir -p "$stage_dir/etc/systemd/system/multi-user.target.wants"
         ln -sf /etc/systemd/system/hetzner-sync-once.service "$stage_dir/etc/systemd/system/multi-user.target.wants/hetzner-sync-once.service"
     fi
+
 
     # ==============================================================================
     # THE CHROOT SANDBOX: Firmware, Initramfs & GRUB Adjustments
@@ -888,34 +1070,18 @@ do_restore_live() {
 
     local grub_success=false
 
-    # Dynamic Chroot Commands based on target OS
-    local CHROOT_CMD="
-        if command -v update-initramfs >/dev/null 2>&1; then update-initramfs -u -k all;
-        elif command -v dracut >/dev/null 2>&1; then dracut --force --regenerate-all;
-        elif command -v mkinitcpio >/dev/null 2>&1; then mkinitcpio -P; fi;
-
-        if command -v update-grub >/dev/null 2>&1; then update-grub;
-        elif command -v grub2-mkconfig >/dev/null 2>&1; then
-            if [ -d /sys/firmware/efi ]; then
-                grub2-mkconfig -o \$(find /boot/efi/EFI -name grub.cfg | head -n 1) || grub2-mkconfig -o /boot/grub2/grub.cfg
-            else
-                grub2-mkconfig -o /boot/grub2/grub.cfg
-            fi
-        elif command -v grub-mkconfig >/dev/null 2>&1; then grub-mkconfig -o /boot/grub/grub.cfg; fi
-    "
-
     if [ -d "/sys/firmware/efi" ]; then
         print_msg "[Chroot] Target is UEFI. Updating Bootloader configuration..."
         mkdir -p "$stage_dir/boot/efi"
         mount --bind /boot/efi "$stage_dir/boot/efi" 2>/dev/null || mount /dev/disk/by-uuid/$live_efi_uuid "$stage_dir/boot/efi"
         
-        if chroot "$stage_dir" /bin/bash -c "$CHROOT_CMD"; then
+        if chroot "$stage_dir" /bin/bash -c "update-initramfs -u -k all && update-grub"; then
             grub_success=true
         fi
         umount "$stage_dir/boot/efi" || true
     else
         print_msg "[Chroot] Target is BIOS. Updating Bootloader configuration..."
-        if chroot "$stage_dir" /bin/bash -c "$CHROOT_CMD"; then
+        if chroot "$stage_dir" /bin/bash -c "update-initramfs -u -k all && update-grub"; then
             grub_success=true
         fi
     fi
@@ -938,7 +1104,7 @@ do_restore_live() {
     if [ "$grub_success" = false ]; then
         print_msg "CRITICAL ERROR: Bootloader compilation failed inside the staging area."
         echo "Because we caught this BEFORE the Rsync phase, your live system is completely untouched."
-        echo "Please check the staging area or logs to determine why update-grub/grub2-mkconfig failed."
+        echo "Please check the staging area or logs to determine why update-grub failed."
         die "Aborting kamikaze restore to prevent bricking the server."
     fi
 
@@ -982,28 +1148,18 @@ do_restore_live() {
     fi
 
     local live_grub_success=false
-    local grub_install_cmd="grub-install"
-    command -v grub2-install >/dev/null 2>&1 && grub_install_cmd="grub2-install"
-
     if [ -d "/sys/firmware/efi" ]; then
         print_msg "UEFI boot detected. Installing GRUB for x86_64-efi..."
         if ! mountpoint -q /boot/efi; then
             mount /boot/efi || echo "[WARNING] Failed to mount /boot/efi."
         fi
-        
-        if $grub_install_cmd --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable --recheck; then
-            if command -v update-grub >/dev/null 2>&1; then update-grub;
-            elif command -v grub2-mkconfig >/dev/null 2>&1; then grub2-mkconfig -o $(find /boot/efi/EFI -name grub.cfg | head -n 1 2>/dev/null || echo /boot/grub2/grub.cfg);
-            elif command -v grub-mkconfig >/dev/null 2>&1; then grub-mkconfig -o /boot/grub/grub.cfg; fi
+        if grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable --recheck && update-grub; then
             live_grub_success=true
         fi
     else
         print_msg "Legacy BIOS detected. Installing GRUB to MBR of /dev/$root_disk..."
         if [ -n "$root_disk" ]; then
-            if $grub_install_cmd "/dev/$root_disk" --target=i386-pc --recheck; then
-                if command -v update-grub >/dev/null 2>&1; then update-grub;
-                elif command -v grub2-mkconfig >/dev/null 2>&1; then grub2-mkconfig -o /boot/grub2/grub.cfg;
-                elif command -v grub-mkconfig >/dev/null 2>&1; then grub-mkconfig -o /boot/grub/grub.cfg; fi
+            if grub-install "/dev/$root_disk" --target=i386-pc --recheck && update-grub; then
                 live_grub_success=true
             fi
         fi
@@ -1012,12 +1168,9 @@ do_restore_live() {
     if [ "$live_grub_success" = false ]; then
         print_msg "CRITICAL ERROR: Bootloader installation failed after Rsync."
         echo "DO NOT REBOOT. You are currently in a volatile state and the system will NOT boot."
-        echo "Please manually run '$grub_install_cmd /dev/sdX' and config generation right now."
+        echo "Please manually run 'grub-install /dev/sdX' and 'update-grub' right now."
         die "Aborting kamikaze reboot to prevent bricking the server."
     fi
-
-    print_msg "Unlocking immutable files in staging area for a later deletion..."
-    chattr -R -i -a "${stage_dir:?}/" 2>/dev/null || true
 
     print_msg "Purging volatile staging area to reclaim disk space..."
     rm -rf "${stage_dir:?}"
@@ -1041,6 +1194,7 @@ do_restore_live() {
     echo u > /proc/sysrq-trigger
     sleep 3
     echo b > /proc/sysrq-trigger
+
 
     } < /dev/null >> "$log_file" 2>&1 &
 
@@ -1097,6 +1251,20 @@ do_delete() {
 
 check_self_update() {
     echo " "
+    
+    if [ "$CONF_TARGET_MODE" = "local" ]; then
+        local remote_script_path="${CONF_LOCAL_REPO_BASE}/${script_name}"
+        if [ -f "$remote_script_path" ] && [ "$remote_script_path" -nt "$0" ]; then
+            echo "Newer script version detected on local storage. Self-updating..."
+            cp -a "$remote_script_path" "$0"
+            echo "Self-update complete. Restarting action with the new script..."
+            exec "$0" "$@"
+        else
+            print_msg "Update check did not find a newer version on local storage."
+        fi
+        return 0
+    fi
+
     local repo_target="${CONF_REPO#*://}"
     repo_target="${repo_target%%/*}"
     local borg_port="${repo_target##*:}"

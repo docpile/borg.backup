@@ -3,6 +3,7 @@
 # BORG BARE-METAL MASTER SCRIPT
 # ==============================================================================
 # Mission: 1:1 System Backups to Hetzner Storage Box & LIVE Bare-Metal Recovery
+#          1:1 System Backups to local mounted storage as well
 # Architecture: 2-File Fire & Forget (Config + Script). Keys Vaulted on Hetzner.
 # ==============================================================================
 

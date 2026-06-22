@@ -32,7 +32,7 @@ However, up to now it was only thoroughly tested on Ubuntu.
 
 ## **Constraints:**
 
-On restore, when the backed up image has been BIOS based, the new minmal install must also be a BIOS based one. When the backed up image was Ubuntu 24.04, the minimal OS must also be of the same OS version. Also, they should follow the same partition layout as this script does **not** alter the partition tables.
+On restore, when the backed up image has been BIOS based, the new minmal install must also be a BIOS based one. When the backed up image e.g. was Ubuntu 24.04, the minimal OS must also be of the same OS version. Also, they should follow the same partition layout as this script does **not** alter the partition tables.
 
 These constraints have to do with the "kamikaze-style" restore. This type of restore was chosen because it's way more provider agnostic (every server provider [Hetzner/OVH...] has different recovery console mechanisms, so you would have to adapt it for each single provider) and often also simpler and faster. Also, this way you always start with a fresh OS instead of first having to deal with a broken or even compromised one.
 

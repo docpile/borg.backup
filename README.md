@@ -26,7 +26,7 @@ However, up to now it was only thoroughly tested on Ubuntu.
 1. Run "borg.backup backup"
 
 ## **Restore:**
-1. First, install the **same minimal OS version** using the **same boot type (BIOS/UEFI)** using **the same partitioning scheme** on the server as the backed up one had, and
+1. First, install the **same minimal OS version** using the **same boot type (BIOS/UEFI)** using **the same partition layout** on the server as the backed up one had, and
 2. then install the script as mentioned above.
 3. Next, execute "borg.backup restore-live". 
 

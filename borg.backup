@@ -13,11 +13,12 @@ set -u
 # CONFIGURATION INGESTION & SANITATION
 # ==============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-CONFIG_FILE="$SCRIPT_DIR/int.backup.borg.config"
+script_name="${0##*/}"
+CONFIG_FILE="$SCRIPT_DIR/${script_name}.config"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo -e "\n[FATAL ERROR] Configuration file missing: $CONFIG_FILE"
-    echo "Please create and set up $0.config in the script directory."
+    echo "Please create and set up ${script_name}.config in the script directory."
     exit 1
 fi
 
@@ -47,8 +48,6 @@ if [ "$CONF_TARGET_MODE" = "ssh" ]; then
 else
     export BORG_RSH="" # Not needed for local mounts
 fi
-
-script_name="${0##*/}"
 
 # ==============================================================================
 # FUNCTIONS

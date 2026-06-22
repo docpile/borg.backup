@@ -33,3 +33,5 @@ On restore, when the backed up image has been BIOS based, the new minmal install
 These constraints have to do with the "kamikaze-style" restore. This type of restore was chosen because it's way more provider agnostic (every server provider [Hetzner/OVH...] has different recovery console mechanisms, so you would have to adapt it for each single provider) and often also simpler and faster. Also, this way you always start with a fresh OS instead of first having to deal with a broken or even compromised one.
 
 You can exclude some additional custom directories from the backup as well as from the restore.
+
+On smaller (likely virtual) servers, to prevent low memory conditions, during the backup a temporary swap file will be created which will be removed again after the backup.

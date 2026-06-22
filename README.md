@@ -9,7 +9,7 @@ Borg backup script to automate backups/restores using either a Hetzner Storage B
   
 However, up to now it was only thoroughly tested on Ubuntu. 
 
-**Before using this in production, test it well!** To be clear on that: **You cannot hold us liable for any damage resulting from the use of this software! You will use it on your own risk!**
+🛑 **Before using this in production, test it well!** To be clear on that: **You cannot hold us liable for any damage resulting from the use of this software! You will use it on your own risk!**
 
 ## **Installation:**
 1. Copy the script and its config file to the server(s)

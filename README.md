@@ -22,10 +22,10 @@ However, up to now it was only thoroughly tested on Ubuntu.
 1. Edit or replace the file on the server or USB drive borg repo.
 2. The script will auto-update on its next run.
 
-## **As for the backup:**
+## **Backup:**
 1. Run "borg.backup backup"
 
-## **As for the restore:**
+## **Restore:**
 1. First, install the same minimal OS version using the same boot type (BIOS/UEFI) on the server as the backed up one was, and
 2. then install the script as mentioned above.
 3. Next, execute "borg.backup restore-live". 

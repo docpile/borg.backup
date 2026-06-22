@@ -1261,7 +1261,7 @@ check_self_update() {
             echo "Self-update complete. Restarting action with the new script..."
             exec "$0" "$@"
         else
-            print_msg "Update check did not find a newer version on local storage."
+            print_msg "Update check: You are running the latest version."
         fi
         return 0
     fi
@@ -1311,7 +1311,7 @@ check_self_update() {
             rm -f "$tmp_script"
         fi
     else
-            print_msg "Update check did not find a newer version."
+            print_msg "Update check: You are running the latest version."
     fi
 }
 

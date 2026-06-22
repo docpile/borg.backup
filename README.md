@@ -18,6 +18,10 @@ However, up to now it was only thoroughly tested on Ubuntu.
 4. Execute "borg.backup install". This will install all the necessary dependencies, and if needed, also initializes the respective Hetzner and borg storage.
 5. If the script file is not already stored in the storage, it will also copy itself there to create a centralizzed auto-update repository for the script. Future script updates will be done exclusively on the storage as the script will self-update on every run. This keeps all your servers in-sync.
 
+## **Updating:**
+1. Edit or replace the file on the server or USB drive borg repo.
+2. The script will auto-update on its next run.
+
 ## **As for the backup:**
 1. Run "borg.backup backup"
 

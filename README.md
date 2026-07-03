@@ -45,7 +45,7 @@ However, up to now it was only thoroughly tested on Ubuntu.
 On restore:
 * When the backed up image has been BIOS based and is should be restored to a newly installed machine, the new minmal install must also be a BIOS based one. Same is true with UEFI.
 * When the backed up image e.g. was Ubuntu 24.04, the minimal OS must also be of the same OS version. Also, they should follow the same partition layout as this script does **not** alter the partition tables.
-* It rewrites the boot record. In case you have several boot options (like, a Windows partition or so), you will most likely have to restore these boot optoins after restore
+* It rewrites the boot record. In case you have several boot options (like, a Windows partition or so), you will most likely have to restore these boot options after restore
 
 These constraints have to do with the "kamikaze-style" restore. This type of restore was chosen because it's way more provider agnostic (every server provider [Hetzner/OVH...] has different recovery console mechanisms, so you would have to adapt it for each single provider) and often also simpler and faster. Also, this way you always start with a fresh OS instead of first having to deal with a broken or even compromised one.
 

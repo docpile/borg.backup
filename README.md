@@ -21,7 +21,7 @@ However, up to now it was only thoroughly tested on Ubuntu.
 2. Make the borg.backup file executable
 3. Change the borg.backup.config file to contain the respective credentials and also to fit your needs
 4. Execute "borg.backup install". This will install all the necessary dependencies, and if needed, also initializes the respective Hetzner and borg storage.
-5. If the script file is not already stored in the storage, it will also copy itself there to create a centralizzed auto-update repository for the script. Future script updates will be done exclusively on the storage as the script will self-update on every run. This keeps all your servers in-sync.
+5. If the script file is not already stored in the storage, it will also copy itself there to create a centralized auto-update repository for the script. Future script updates will be done exclusively on the storage as the script will self-update on every run. This keeps all your servers in-sync.
 
 ## **Updating:**
 1. Edit or replace the file on the server or USB drive borg repo.
@@ -38,7 +38,7 @@ However, up to now it was only thoroughly tested on Ubuntu.
    * The script will try to automatically set the IP address of the current machine it is restored on
    * It will also try to adapt to different hardware (which is quite easy in Linux)
    * After restore and reboot, it will initiate an autoupdate for the OS, thereby bringing it's components up to date
-   * You might wonder why it also searches for a file /private-backup/var/clusterstatus and some other files in similar directories. The reason is simple: In my setups it determines the current role of a cluster server. Depending on that, some more actions are taken. This very part is only executed in case it finds my encironment. If not, thos is "dead code" that will not be executed on your machine.
+   * You might wonder why it also searches for a file /private-backup/var/clusterstatus and some other files in similar directories. The reason is simple: In my setups it determines the current role of a cluster server. Depending on that, some more actions are taken. This very part is only executed in case it finds my environment. If not, this is just "dead code" that will not be executed on your machine.
 
 ## **Constraints:**
 

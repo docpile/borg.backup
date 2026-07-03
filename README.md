@@ -11,7 +11,8 @@ However, up to now it was only thoroughly tested on Ubuntu.
 
 **How it works:**
 * It backups/restores strictly on a file level. This means, no partition table changes are done. The partitions must be prepared beforehand
-* it does a "kamikaze" style restore, meaning replacing the current data by the one in the backup. This has some limitations but should work in most environments
+* **Do not use this script in a "rescue system" environment** of your server! In case your system is not bootable anymore, reinstall it with a minimal system first, then install and run the script from there!
+* It does a "kamikaze" style restore, meaning replacing the current data on your current root by the one in the backup. This has some limitations but should work in most environments
 
 
 🛑 **Before using this in production, test it well!** To be clear on that: ***You cannot hold us liable for any damage resulting from the use of this software! You will use it on your own risk!***

@@ -64,23 +64,24 @@ cleanup_temp_swap() {
         unset BORG_TMP_SWAP
     fi
 }
-trap cleanup_temp_swap EXIT
+trap cleanup_temp_swap EXIT INT TERM QUIT
 
 setup_temp_swap() {
+
     local mem_avail
     mem_avail=$(free -m | awk '/^Mem:/{print $7}')
     local swap_free
     swap_free=$(free -m | awk '/^Swap:/{print $4}')
     local total_headroom=$((mem_avail + swap_free))
     
-    if [ "$total_headroom" -lt 8192 ]; then
+    if [ "$total_headroom" -lt 1024 ]; then
         print_msg "Low memory headroom detected (${total_headroom}MB). Verifying disk space for temporary swap..."
         local free_space_mb
         free_space_mb=$(df -m /var/tmp | awk 'NR==2 {print $4}')
         
         # Require at least 1GB (1024MB) to remain free on the disk after swap creation
         local disk_buffer_mb=1024
-        local max_swap_mb=8192
+        local max_swap_mb=1024
         local available_for_swap_mb=$((free_space_mb - disk_buffer_mb))
         
         if [ "$available_for_swap_mb" -ge 1024 ]; then
@@ -109,6 +110,17 @@ setup_temp_swap() {
     fi
 }
 
+garbage_collector() {
+    # GARBAGE COLLECTION
+    # Destroy any orphaned swap files from previous aborted runs or SysRq reboots
+    for stale_swap in /var/tmp/borg_tmp_swap_*.img; do
+        if [ -f "$stale_swap" ]; then
+            swapoff "$stale_swap" 2>/dev/null || true
+            rm -f "$stale_swap"
+            echo " -> Purged stale swap file: $stale_swap"
+        fi
+    done
+}
 
 sync_borg_version() {
     if command -v borg >/dev/null 2>&1; then
@@ -230,6 +242,9 @@ setup_ssh_connection() {
 }
 
 do_housekeeping() {
+	
+	garbage_collector
+	
     if [ "$CONF_TARGET_MODE" = "local" ]; then
         print_msg "Housekeeping is not required for local storage mode."
         return 0
@@ -402,7 +417,8 @@ do_install() {
 }
 
 do_backup() {
-    local custom_comment="${1:-}"
+    garbage_collector
+	local custom_comment="${1:-}"
     sync_borg_version
     print_msg "Starting Full System Backup for $CONF_MACHINE_NAME (Using: ${BORG_REMOTE_PATH:-default})"
 
@@ -610,8 +626,15 @@ select_archive() {
     echo "========================================================" >&2
     echo "" >&2
 
-    local selection
-    read -p "Enter the number of the backup to use (1-${#short_list[@]}): " selection >&2
+    local default_selection=${#short_list[@]}
+	local selection
+    read -p "Enter the number of the backup to use (1-${#short_list[@]}) [Default: $default_selection]: " selection >&2
+
+	selection=$(echo -n "$selection" | tr -d '\r\n\t ')
+	
+	if [ -z "$selection" ]; then
+		selection=$default_selection
+	fi
 
     if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "${#short_list[@]}" ]; then
         die "Invalid selection. Aborting."
@@ -621,7 +644,8 @@ select_archive() {
 }
 
 do_restore_file() {
-    setup_ssh_connection
+    garbage_collector
+	setup_ssh_connection
     sync_borg_version
     
     select_repository
@@ -784,6 +808,8 @@ do_restore_file() {
 }
 
 do_restore_live() {
+    garbage_collector
+    
     setup_ssh_connection
     sync_borg_version
     
@@ -868,6 +894,13 @@ do_restore_live() {
     live_efi_uuid=$(findmnt -n -o UUID /boot/efi || true)
     live_swap_uuid=$(blkid -t TYPE=swap -s UUID -o value | head -n1 || true)
 
+    # 2.4 Pre-Flight Cleanup
+    print_msg "Purging stale staging areas to ensure accurate space calculations..."
+    if [ -d "$stage_dir" ]; then
+        chattr -R -i -a "$stage_dir" 2>/dev/null || true
+        rm -rf "${stage_dir:?}"
+    fi
+
     # 2.5 Spatial Pre-Flight Check
     print_msg "Calculating spatial requirements (checking disk space)..."
     local required_bytes
@@ -890,8 +923,13 @@ do_restore_live() {
     fi
 
     # 3. Prepare Staging Area
+    print_msg "Triggering memory protection for extraction..."
+    setup_temp_swap
+    if [ -n "${BORG_TMP_SWAP:-}" ]; then
+        CONF_EXCLUDES+=("--exclude=$BORG_TMP_SWAP")
+    fi
+
     print_msg "Creating staging area at $stage_dir..."
-    rm -rf "${stage_dir:?}"
     mkdir -p "$stage_dir"
     cd "$stage_dir" || die "Failed to enter $stage_dir"
 
@@ -931,9 +969,13 @@ do_restore_live() {
         # Recreate Excluded Swap Files
         local swap_file
         swap_file=$(awk '(!/^#/ && $3 == "swap" && $1 ~ /^\//) {print $1}' "$stage_dir/etc/fstab" | head -n1)
-        if [ -n "$swap_file" ] && [ ! -f "$stage_dir$swap_file" ]; then
-            print_msg " -> Recreating excluded swap file ($swap_file) to prevent boot failure..."
-            fallocate -l 2G "$stage_dir$swap_file" 2>/dev/null || dd if=/dev/zero of="$stage_dir$swap_file" bs=1M count=2048 status=none
+        if [ -z "$swap_file" ]; then
+            swap_file="/swapfile"
+            echo "$swap_file none swap sw 0 0" >> "$stage_dir/etc/fstab"
+        fi
+        if [ ! -f "$stage_dir$swap_file" ]; then
+            print_msg " -> Provisioning permanent 1GB swap file ($swap_file)..."
+            fallocate -l 1G "$stage_dir$swap_file" 2>/dev/null || dd if=/dev/zero of="$stage_dir$swap_file" bs=1M count=1024 status=none
             chmod 600 "$stage_dir$swap_file"
             mkswap "$stage_dir$swap_file" >/dev/null 2>&1 || true
         fi
@@ -956,7 +998,7 @@ do_restore_live() {
         if [ -n "$old_gw" ] && [ -n "$live_gw" ]; then
             sed -i -E "s|\\b${old_gw}\\b|${live_gw}|g" "$target_np"
         fi
-        sed -i -E "s|addresses: \[[0-9\., ]+\]|addresses: [${live_dns}, 8.8.8.8]|g" "$target_np"
+        sed -i -E "s|addresses: \[[0-9\., ]+\]|addresses: [${live_dns}, 8.8.8.8, 1.1.1.1]|g" "$target_np"
         
         if [ -n "$live_mac1" ] && [ -n "$live_iface" ]; then
             awk -v iface="^[[:space:]]*${live_iface}:" -v mac="${live_mac1}" '$0 ~ iface { m=1 } m && /macaddress:/ { sub(/macaddress:.*/, "macaddress: " mac); m=0 } 1' "$target_np" > "${target_np}.tmp" && mv "${target_np}.tmp" "$target_np"
@@ -964,6 +1006,41 @@ do_restore_live() {
         if [ -n "$live_mac2" ] && [ -n "$live_iface_sec" ]; then
             awk -v iface="^[[:space:]]*${live_iface_sec}:" -v mac="${live_mac2}" '$0 ~ iface { m=1 } m && /macaddress:/ { sub(/macaddress:.*/, "macaddress: " mac); m=0 } 1' "$target_np" > "${target_np}.tmp" && mv "${target_np}.tmp" "$target_np"
         fi
+    fi
+    
+    # ==============================================================================
+    # AUTOMATED SERVICE IP REMAPPING (Smart Identity Migration)
+    # ==============================================================================
+    OLD_IP=$(grep -h -oE "\b([0-9]{1,3}\.){3}[0-9]{1,3}\b" "$stage_dir/etc/netplan/"* | head -n1)
+    if [ -n "$OLD_IP" ] && [ "$OLD_IP" != "$live_ip" ]; then
+        print_msg "Identity detected: Old IP $OLD_IP found in backup. Remapping to new Live IP $live_ip..."
+        
+        # Scoped replacement: Only touch critical configuration paths to avoid corrupting binaries or system noise
+        # This keeps cluster aliases intact while updating primary binds.
+        find "$stage_dir/etc/" -type f \( \
+            -path "*/postfix/*" -o \
+            -path "*/dovecot/*" -o \
+            -path "*/apache2/*" -o \
+            -path "*/nginx/*" -o \
+            -path "*/bind/*" -o \
+            -path "*/var/www/vhosts/*" -o \
+            -path "*/var/www/clients/*" -o \
+            -path "*/usr/local/psa/admin/conf/*" -o \
+            -path "*/hosts" \
+        \) -exec sed -i "s/\b$OLD_IP\b/$live_ip/g" {} +
+        
+        print_msg " -> Service configuration successfully remapped."
+    fi
+    
+    # ==============================================================================
+    # DATABASE DUMP IP PATCHING (SQL/Text-based only)
+    # ==============================================================================
+    # We scan the staging area for .sql files (standard backups) and patch them.
+    # This safely updates Plesk/ISPConfig databases before they are imported.
+    if [ -n "$OLD_IP" ] && [ "$OLD_IP" != "$live_ip" ]; then
+        print_msg "Searching for SQL database dumps to patch..."
+        find "$stage_dir" -type f -name "*.sql" -exec sed -i "s/\b$OLD_IP\b/$live_ip/g" {} +  
+        print_msg " -> SQL Database dumps patched successfully."
     fi
 
     # 3. Hardware / Cloud-Init Cleanup
@@ -1096,7 +1173,6 @@ do_restore_live() {
         ln -sf /etc/systemd/system/hetzner-sync-once.service "$stage_dir/etc/systemd/system/multi-user.target.wants/hetzner-sync-once.service"
     fi
 
-
     # ==============================================================================
     # THE CHROOT SANDBOX: Firmware, Initramfs & GRUB Adjustments
     # ==============================================================================
@@ -1181,19 +1257,37 @@ do_restore_live() {
     local sockets_to_stop=$(systemctl list-units --type=socket --state=active --no-legend | awk '{print $1}' | grep -vE "$keep_alive_regex" || true)
     if [ -n "$sockets_to_stop" ]; then
         for sock in $sockets_to_stop; do
-            systemctl stop "$sock" || true
+            systemctl stop "$sock" 2>/dev/null || true
         done
     fi
 
     local services_to_stop=$(systemctl list-units --type=service --state=running --no-legend | awk '{print $1}' | grep -vE "$keep_alive_regex" || true)
     if [ -n "$services_to_stop" ]; then
         for svc in $services_to_stop; do
-            systemctl stop "$svc" || true
+            systemctl kill --kill-who=all -s SIGKILL "$svc" 2>/dev/null || systemctl stop "$svc" 2>/dev/null || true
         done
     fi
 
-    print_msg "Executing live filesystem swap via Rsync..."
-    rsync -aAXSH --info=progress2 --numeric-ids --delete \
+    print_msg "Dropping old filesystem locks (Quotas & Immutable flags)..."
+    # 1. Turn off live kernel quota tracking
+    quotaoff -a 2>/dev/null || true
+    # 2. Unlock root quota files
+    chattr -i -a /quota.user /quota.group 2>/dev/null || true
+    # 3. Preemptively unlock ISPConfig client directories on the live root (if they exist from a previous attempt)
+    if [ -d "/var/www/clients" ]; then
+        chattr -R -i -a /var/www/clients 2>/dev/null || true
+    fi
+    
+    print_msg "Unmounting application bind mounts to prevent rsync Device Busy errors..."
+    # Lazy unmount any active bind mounts in web hosting directories (ISPConfig/Plesk)
+    if [ -d "/var/www/clients" ] || [ -d "/var/www/vhosts" ]; then
+        awk '{print $2}' /proc/mounts | grep -E '^/var/www/(clients|vhosts)/' | sort -r | while read -r mnt; do
+            umount -l "$mnt" 2>/dev/null || true
+        done
+    fi
+    
+    print_msg "Executing live filesystem swap via Rsync, be patient..."
+    rsync -aAXSH --numeric-ids --delete \
         "${CONF_EXCLUDES[@]:-}" \
         "$stage_dir/" /
 
@@ -1235,6 +1329,9 @@ do_restore_live() {
     fi
 
     print_msg "Purging volatile staging area to reclaim disk space..."
+    if [ -d "$stage_dir" ]; then
+        chattr -R -i -a "$stage_dir" 2>/dev/null || true
+    fi
     rm -rf "${stage_dir:?}"
 
     print_msg "Restore finished. Initiating forced kernel reboot..."

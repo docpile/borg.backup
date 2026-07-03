@@ -9,6 +9,11 @@ Borg backup script to automate backups/restores using either a Hetzner Storage B
   
 However, up to now it was only thoroughly tested on Ubuntu. 
 
+**How it works:**
+* It backups/restores strictly on a file level. This means, no partition table changes are done. The partitions must be prepared beforehand
+* it does a "kamikaze" style restore, meaning replacing the current data by the one in the backup. This has some limitations but should work in most environments
+
+
 🛑 **Before using this in production, test it well!** To be clear on that: ***You cannot hold us liable for any damage resulting from the use of this software! You will use it on your own risk!***
 
 ## **Installation:**
@@ -28,7 +33,8 @@ However, up to now it was only thoroughly tested on Ubuntu.
 ## **Restore:**
 1. First, if needed because your old install is not bootable anymore, install the **same minimal OS version** using the **same boot type (BIOS/UEFI)** using **the same partition layout** on the server as the backed up one had, and
 2. then install the script as mentioned above.
-3. Next, execute "borg.backup restore-live".
+3. Make sure you have enough local free space on the partition mounted on / as the data will temporarily be written there
+4. Next, execute "borg.backup restore-live".
    * The script will try to automatically set the IP address of the current machine it is restored on
    * It will also try to adapt to different hardware (which is quite easy in Linux)
    * After restore and reboot, it will initiate an autoupdate for the OS, therebybfringing it's components up to date
@@ -39,6 +45,7 @@ However, up to now it was only thoroughly tested on Ubuntu.
 On restore:
 * When the backed up image has been BIOS based and is should be restored to a newly installed machine, the new minmal install must also be a BIOS based one. Same is true with UEFI.
 * When the backed up image e.g. was Ubuntu 24.04, the minimal OS must also be of the same OS version. Also, they should follow the same partition layout as this script does **not** alter the partition tables.
+* It rewrites the boot record. In case you have several boot options (like, a Windows partition or so), you will most likely have to restore these boot optoins after restore
 
 These constraints have to do with the "kamikaze-style" restore. This type of restore was chosen because it's way more provider agnostic (every server provider [Hetzner/OVH...] has different recovery console mechanisms, so you would have to adapt it for each single provider) and often also simpler and faster. Also, this way you always start with a fresh OS instead of first having to deal with a broken or even compromised one.
 

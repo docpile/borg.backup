@@ -31,7 +31,7 @@ However, up to now it was only thoroughly tested on Ubuntu.
 3. Next, execute "borg.backup restore-live".
    * The script will try to automatically set the IP address of the current machine it is restored on
    * It will also try to adapt to different hardware (which is quite easy in Linux)
-   * After restore and reboot, it will initiate an autoupdate for the OS, thereby fringing it's comonents up to date
+   * After restore and reboot, it will initiate an autoupdate for the OS, therebybfringing it's components up to date
    * You might wonder why ot also searches for a file /private-backup/var/clusterstatus. The reason is simple: In my setups it determines the current role of a cluster server. Depending on that, some more actions are taken. This very part is only executed in case it finds my encironment. If not, thos is "dead code" that will not be executed on your machine.
 
 ## **Constraints:**

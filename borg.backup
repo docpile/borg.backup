@@ -418,6 +418,7 @@ do_install() {
 
 do_backup() {
     garbage_collector
+	do_clean_stage
 	local custom_comment="${1:-}"
     sync_borg_version
     print_msg "Starting Full System Backup for $CONF_MACHINE_NAME (Using: ${BORG_REMOTE_PATH:-default})"
@@ -1257,7 +1258,7 @@ do_restore_live() {
     local sockets_to_stop=$(systemctl list-units --type=socket --state=active --no-legend | awk '{print $1}' | grep -vE "$keep_alive_regex" || true)
     if [ -n "$sockets_to_stop" ]; then
         for sock in $sockets_to_stop; do
-            systemctl stop "$sock" 2>/dev/null || true
+            systemctl stop  --no-block  "$sock" 2>/dev/null || true
         done
     fi
 
@@ -1362,6 +1363,158 @@ do_restore_live() {
 
     # Stream the logs to the user until the background process finishes (or the system reboots)
     tail -f "$log_file" --pid="$bg_pid" || true
+}
+
+do_restore_stage() {
+    garbage_collector
+    
+    setup_ssh_connection
+    sync_borg_version
+    
+    select_repository
+
+    local archive="${2:-}"
+    if [ -z "$archive" ]; then
+        archive=$(select_archive)
+    fi
+
+    # Strip hidden carriage returns/whitespaces
+    archive=$(echo -n "$archive" | tr -d '\r' | xargs)
+
+    if [ -z "$archive" ]; then
+        die "Archive selection resulted in an empty string. Aborting."
+    fi
+
+    local default_stage_dir="/restore_stage_$(date +%s)"
+    local stage_dir
+    
+    # Input Loop with Zero-Trust Collision Protection
+    while true; do
+        read -p "Enter absolute path for staging directory [Default: $default_stage_dir]: " stage_dir
+        
+        # Clean user input
+        stage_dir=$(echo -n "$stage_dir" | tr -d '\r\n\t ')
+        if [ -z "$stage_dir" ]; then
+            stage_dir="$default_stage_dir"
+        fi
+
+        # Strip trailing slash for exact path matching, map empty string back to root
+        local clean_stage_dir="${stage_dir%/}"
+        if [ -z "$clean_stage_dir" ]; then clean_stage_dir="/"; fi
+        
+        local is_forbidden=false
+        # Explicit blocklist of system critical directories
+        local forbidden_dirs=("/etc" "/proc" "/sys" "/dev" "/boot" "/usr" "/bin" "/sbin" "/lib" "/lib32" "/lib64" "/run" "/root" "/var" "/opt" "/srv")
+        
+        # Check against root specifically
+        if [ "$clean_stage_dir" = "/" ]; then
+            is_forbidden=true
+        else
+            for fdir in "${forbidden_dirs[@]}"; do
+                # Match exactly the forbidden dir, or any subdirectory inside it
+                if [[ "$clean_stage_dir" == "$fdir" ]] || [[ "$clean_stage_dir" == "$fdir/"* ]]; then
+                    is_forbidden=true
+                    break
+                fi
+            done
+        fi
+        
+        if [ "$is_forbidden" = true ]; then
+            echo -e "\n[ERROR] Path '$stage_dir' intersects with a critical system directory." >&2
+            echo "To prevent system corruption, you cannot stage inside /, /etc, /proc, /usr, /var, etc." >&2
+            echo "Please choose an isolated path (e.g., /restore_stage)." >&2
+            echo "" >&2
+        else
+            break # Valid path, exit loop
+        fi
+    done
+
+    print_msg "Calculating spatial requirements (checking disk space)..."
+    local required_bytes
+    required_bytes=$(borg info --json ::"$archive" 2>/dev/null | python3 -c "import sys, json; d=json.load(sys.stdin); print(d['archives'][0]['stats']['original_size']) if 'archives' in d else sys.exit(1)" 2>/dev/null)
+    
+    if [ -z "$required_bytes" ] || ! [[ "$required_bytes" =~ ^[0-9]+$ ]]; then
+        die "Failed to parse spatial requirements. Archive '$archive' is inaccessible or invalid."
+    fi
+
+    # Ascend the directory tree to find the nearest existing mount point for space checking
+    local check_dir="$stage_dir"
+    while [ ! -d "$check_dir" ] && [ "$check_dir" != "/" ]; do
+        check_dir=$(dirname "$check_dir")
+    done
+
+    local free_bytes
+    free_bytes=$(df -B1 "$check_dir" | awk 'NR==2 {print $4}')
+    
+    # Add a 10% safety buffer for temporary files and Borg cache
+    local buffered_bytes=$(( required_bytes + (required_bytes / 10) ))
+    
+    if [ "$free_bytes" -lt "$buffered_bytes" ]; then
+        local req_gb=$(( buffered_bytes / 1024 / 1024 / 1024 ))
+        local free_gb=$(( free_bytes / 1024 / 1024 / 1024 ))
+        die "Insufficient disk space! Archive requires ~${req_gb}GB, but only ${free_gb}GB is free on $check_dir."
+    fi
+
+    print_msg "Triggering memory protection for extraction..."
+    setup_temp_swap
+    if [ -n "${BORG_TMP_SWAP:-}" ]; then
+        CONF_EXCLUDES+=("--exclude=$BORG_TMP_SWAP")
+    fi
+
+    print_msg "Creating staging area at $stage_dir..."
+    mkdir -p "$stage_dir" || die "Failed to create directory $stage_dir"
+    
+    # Inject safety markers for the garbage collector
+    touch "$stage_dir/.borg_stage_marker"
+    echo "$stage_dir" >> "/var/tmp/borg_stage_dirs.list"
+    
+    cd "$stage_dir" || die "Failed to enter $stage_dir"
+
+    print_msg "Extracting $archive to $stage_dir..."
+    echo "This might take a while depending on the archive size."
+    borg extract --sparse --numeric-ids ::"$archive" || die "Extraction failed! Aborting."
+
+    print_msg "Restore to stage complete. \n  => Files are available safely isolated at: $stage_dir"
+    
+    # Return to script execution dir
+    cd "$SCRIPT_DIR" || true
+}
+
+do_clean_stage() {
+    local list_file="/var/tmp/borg_stage_dirs.list"
+    local found_any=false
+
+    print_msg "Cleaning temporary restore staging directories..."
+
+    # 1. Clean directories explicitly tracked by the list file
+    if [ -f "$list_file" ]; then
+        sort -u "$list_file" | while IFS= read -r s_dir; do
+            s_dir=$(echo "$s_dir" | xargs)
+            if [ -n "$s_dir" ] && [ -f "$s_dir/.borg_stage_marker" ]; then
+                echo " -> Purging staging directory: $s_dir"
+                chattr -R -i -a "$s_dir" 2>/dev/null || true
+                rm -rf "${s_dir:?}"
+                found_any=true
+            elif [ -n "$s_dir" ] && [ -d "$s_dir" ]; then
+                echo " -> [WARNING] Directory $s_dir is missing safety '.borg_stage_marker'. Skipping."
+            fi
+        done
+        rm -f "$list_file"
+    fi
+
+    # 2. Fallback: Catch any default named directories in the root filesystem
+    for default_dir in /restore_stage_*; do
+        if [ -d "$default_dir" ] && [ -f "$default_dir/.borg_stage_marker" ]; then
+            echo " -> Purging orphaned staging directory: $default_dir"
+            chattr -R -i -a "$default_dir" 2>/dev/null || true
+            rm -rf "${default_dir:?}"
+            found_any=true
+        fi
+    done
+
+    if [ "$found_any" = false ]; then
+        echo " -> No staging directories found to clean."
+    fi
 }
 
 
@@ -1489,6 +1642,8 @@ case "${1:-}" in
     housekeeping) do_housekeeping ;;
     restore-file) do_restore_file "$@" ;;
     restore-live) do_restore_live "$@" ;;
+	restore-to-stage) do_restore_stage "$@" ;;
+	clean-stage)  do_clean_stage ;;
     *)
         echo "Usage: $0 install"
         echo "       $0 backup [\"comment\"]"
@@ -1498,6 +1653,8 @@ case "${1:-}" in
         echo "       $0 housekeeping"
         echo "       $0 restore-file"
         echo "       $0 restore-live"
+		echo "       $0 restore-to-stage"
+		echo "       $0 clean-stage"
         echo " "
         exit 1
         ;;

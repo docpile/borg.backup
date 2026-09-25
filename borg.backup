@@ -56,6 +56,27 @@ fi
 print_msg() { echo -e "\n=============================================================================\n[$(date '+%Y-%m-%d %H:%M:%S')] => $1 \n"; }
 die() { echo -e "\n[FATAL ERROR] $1" >&2; exit 1; }
 
+
+safe_apt_install() {
+    # Simulate installation first to check for any package removals
+    local sim_output
+    sim_output=$(LC_ALL=C apt-get install -s -yqq "$@" 2>&1)
+    if echo "$sim_output" | grep -qE "(Remv|The following packages will be REMOVED)"; then
+        echo -e "\n[WARNING] APT simulation detected that the following installation will remove existing system packages:" >&2
+        echo "$sim_output" | grep -A 15 "REMOVED" >&2
+        echo "" >&2
+        read -p "Do you want to proceed and allow these package removals? (y/N) " -n 1 -r
+        echo "" >&2
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            die "Aborted by user to protect the server from package removal."
+        fi
+        apt-get install -y "$@"
+    else
+        # Proceed with normal silent installation if no removals are detected
+        apt-get install -yqq "$@"
+    fi
+}
+
 cleanup_temp_swap() {
     if [ -n "${BORG_TMP_SWAP:-}" ] && [ -f "$BORG_TMP_SWAP" ]; then
         echo -e "\n[INFO] Removing temporary swap file..."
@@ -164,7 +185,7 @@ setup_ssh_connection() {
     if ! command -v sshpass >/dev/null 2>&1; then
         print_msg "sshpass not found. Installing dynamically..."
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq && apt-get install -yqq sshpass
+        apt-get update -qq && safe_apt_install sshpass
     fi
 
     local vault_path=".ssh/vault_${CONF_MACHINE_NAME}_id"
@@ -316,10 +337,25 @@ do_housekeeping() {
 }
 
 do_install() {
+    local fuse_setuid="false"
+    echo -e "\n[SECURITY CONFIGURATION]"
+    read -p "Allow non-root users (userland) to mount FUSE filesystems? (y/N) " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        fuse_setuid="true"
+    fi
     if [ "$CONF_TARGET_MODE" = "local" ]; then
-        print_msg "Installing requirements (Borg, MariaDB-Client, Rsync)"
+        print_msg "Installing requirements (Borg, MariaDB-Client, Rsync, FUSE)"
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq && apt-get install -yqq borgbackup mariadb-client rsync
+
+        # Pre-configure debconf to allow userland FUSE mounting if requested
+        if command -v debconf-set-selections >/dev/null 2>&1; then
+            echo "fuse fuse/setuid boolean $fuse_setuid" | debconf-set-selections 2>/dev/null || true
+            echo "fuse3 fuse3/setuid boolean $fuse_setuid" | debconf-set-selections 2>/dev/null || true
+        fi
+
+        apt-get update -qq && safe_apt_install borgbackup mariadb-client rsync fuse3
+        safe_apt_install python3-llfuse python3-pyfuse3 2>/dev/null || safe_apt_install python3-llfuse 2>/dev/null || true
 
         sync_borg_version
 
@@ -358,9 +394,18 @@ do_install() {
     fi
 
     # SSH Installation Flow
-    print_msg "Installing requirements \n(Borg, Openssh-Client, MariaDB-Client, Rsync, SshPass)"
+    print_msg "Installing requirements \n(Borg, Openssh-Client, MariaDB-Client, Rsync, SshPass, fuse)"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq && apt-get install -yqq borgbackup openssh-client mariadb-client rsync sshpass
+
+    # Pre-configure debconf to allow userland FUSE mounting if requested
+    if command -v debconf-set-selections >/dev/null 2>&1; then
+        echo "fuse fuse/setuid boolean $fuse_setuid" | debconf-set-selections 2>/dev/null || true
+        echo "fuse3 fuse3/setuid boolean $fuse_setuid" | debconf-set-selections 2>/dev/null || true
+    fi
+
+
+    apt-get update -qq && safe_apt_install borgbackup openssh-client mariadb-client rsync sshpass fuse3
+    safe_apt_install python3-llfuse python3-pyfuse3 2>/dev/null || safe_apt_install python3-llfuse 2>/dev/null || true
 
     setup_ssh_connection
     sync_borg_version
@@ -484,6 +529,12 @@ do_check() {
     sync_borg_version
     print_msg "Verifying backup repository integrity"
     borg check --repository-only --show-rc
+}
+
+do_repair() {
+    sync_borg_version
+    print_msg "Attempting to repair corrupted repository"
+    borg check --repair --show-rc
 }
 
 do_list() {
@@ -1518,6 +1569,208 @@ do_clean_stage() {
 }
 
 
+do_restore_delta() {
+    garbage_collector
+    setup_ssh_connection
+    sync_borg_version
+
+    select_repository
+
+    echo "" >&2
+    print_msg "Select BASELINE Archive (The 'From' state)"
+    local archive_a=$(select_archive)
+    archive_a=$(echo -n "$archive_a" | tr -d '\r' | xargs)
+    if [ -z "$archive_a" ]; then die "Archive selection resulted in an empty string. Aborting."; fi
+
+    echo "" >&2
+    print_msg "Select TARGET Archive (The 'To' state - Delta will be extracted from here)"
+    local archive_b=$(select_archive)
+    archive_b=$(echo -n "$archive_b" | tr -d '\r' | xargs)
+    if [ -z "$archive_b" ]; then die "Archive selection resulted in an empty string. Aborting."; fi
+
+    if [ "$archive_a" = "$archive_b" ]; then
+        die "Source and Target archives are identical. No delta to extract."
+    fi
+
+    # Staging Directory Setup & Collision Protection
+    local default_stage_dir="/restore_delta_$(date +%s)"
+    local stage_dir
+    
+    while true; do
+        read -p "Enter absolute path for delta restore directory [Default: $default_stage_dir]: " stage_dir
+        stage_dir=$(echo -n "$stage_dir" | tr -d '\r\n\t ')
+        if [ -z "$stage_dir" ]; then
+            stage_dir="$default_stage_dir"
+        fi
+
+        local clean_stage_dir="${stage_dir%/}"
+        if [ -z "$clean_stage_dir" ]; then clean_stage_dir="/"; fi
+        
+        local is_forbidden=false
+        local forbidden_dirs=("/etc" "/proc" "/sys" "/dev" "/boot" "/usr" "/bin" "/sbin" "/lib" "/lib32" "/lib64" "/run" "/root" "/var" "/opt" "/srv")
+        
+        if [ "$clean_stage_dir" = "/" ]; then
+            is_forbidden=true
+        else
+            for fdir in "${forbidden_dirs[@]}"; do
+                if [[ "$clean_stage_dir" == "$fdir" ]] || [[ "$clean_stage_dir" == "$fdir/"* ]]; then
+                    is_forbidden=true
+                    break
+                fi
+            done
+        fi
+        
+        if [ "$is_forbidden" = true ]; then
+            echo -e "\n[ERROR] Path '$stage_dir' intersects with a critical system directory." >&2
+            echo "To prevent overwriting live files with older/newer versions, you cannot stage in system paths." >&2
+            echo "Please choose an isolated path (e.g., /restore_delta)." >&2
+            echo "" >&2
+        else
+            break
+        fi
+    done
+
+    mkdir -p "$stage_dir" || die "Failed to create directory $stage_dir"
+    touch "$stage_dir/.borg_stage_marker"
+    echo "$stage_dir" >> "/var/tmp/borg_stage_dirs.list"
+
+    print_msg "Calculating Delta between '$archive_a' and '$archive_b'..."
+    echo "Please wait. Borg is traversing both archives to map changes..."
+
+    local diff_out="$stage_dir/.borg_diff_raw.txt"
+    local pattern_file="$stage_dir/.borg_patterns.txt"
+    local removed_list="$stage_dir/_REMOVED_FILES_LIST.txt"
+    local py_script="$stage_dir/.borg_parser.py"
+    
+    # Calculate the diff
+    borg diff ::"$archive_a" "$archive_b" > "$diff_out" || die "Borg diff failed. Aborting."
+
+    > "$pattern_file"
+    > "$removed_list"
+
+    # Robust Python Parser via Here-Doc (Filters metadata-noise & secures regex)
+    cat << 'EOF' > "$py_script"
+import sys, re
+
+pat_file, rm_file, diff_file = sys.argv[1:4]
+added = 0; mod = 0; rm = 0; seen = set()
+
+with open(diff_file, 'r') as f, open(pat_file, 'w') as p, open(rm_file, 'w') as r:
+    for line in f:
+        line = line.strip('\n')
+        if not line: continue
+        
+        status = None
+        path = None
+        
+        # 1. Added/Removed directories, links, special files
+        m = re.match(r'^(added|removed)\s+(directory|link|block device|char device|fifo)\s+(.*)$', line)
+        if m:
+            status, _, path = m.groups()
+        else:
+            # 2. Added/Removed standard files with size indicators
+            m = re.match(r'^(added|removed)\s+[0-9.]+\s+[a-zA-Z]+\s+(.*)$', line)
+            if m:
+                status, path = m.groups()
+            else:
+                # 3. Borg 1.1 fallback explicit 'modified'
+                m = re.match(r'^modified\s+(.*)$', line)
+                if m:
+                    status, path = 'modified', m.group(1)
+                else:
+                    # 4. Borg 1.2+ Data/Size change indicators (e.g. "+1.5 MB -1.5 MB [ctime...] path")
+                    m = re.match(r'^\s*([+-]?[0-9.]+)\s+[a-zA-Z]+\s+([+-]?[0-9.]+)\s+[a-zA-Z]+\s+(.*)$', line)
+                    if m:
+                        plus_val, minus_val, remainder = m.groups()
+                        
+                        # NOISE FILTER: If strictly 0 bytes changed, it is a metadata-only change (e.g. chown, chmod). Skip it.
+                        if float(plus_val) == 0.0 and float(minus_val) == 0.0:
+                            continue
+                        
+                        status = 'modified'
+                        # Strip any trailing metadata tags like [ctime: ...] to isolate the actual file path
+                        path = re.sub(r'^(?:\[[a-z]+:\s*[^\]]+\]\s*)+', '', remainder)
+                    else:
+                        # 5. Metadata-only lines (e.g., directories that just had mtime updated)
+                        m = re.match(r'^(?:\[[a-z]+:\s*[^\]]+\]\s*)+(.*)$', line)
+                        if m:
+                            continue # Skip metadata-only noise
+                        else:
+                            continue
+        
+        if status and path:
+            if path == '.': continue # Skip the root directory itself
+            
+            if status == 'removed':
+                r.write(path + '\n')
+                rm += 1
+            else:
+                if status == 'added': added += 1
+                if status == 'modified': mod += 1
+                
+                # Build EXACT REGEX inclusion rules for Borg's strict traversal engine
+                parts = path.split('/')
+                curr = ''
+                for part in parts:
+                    curr = part if not curr else curr + '/' + part
+                    if curr not in seen:
+                        seen.add(curr)
+                        escaped = re.escape(curr)
+                        p.write('+ re:^' + escaped + '$\n')
+
+print(f"{added} {mod} {rm}")
+EOF
+
+    local counts
+    counts=$(python3 "$py_script" "$pattern_file" "$removed_list" "$diff_out")
+    read -r added_count mod_count rm_count <<< "$counts"
+    local total_extract=$((added_count + mod_count))
+
+    if [ "$total_extract" -eq 0 ]; then
+        print_msg "No physical content changes found. (Only metadata/timestamp changes were detected)."
+        if [ "$rm_count" -gt 0 ]; then
+            echo "Note: $rm_count files were removed in the target state. List saved to $removed_list"
+        fi
+        echo "Nothing to extract. Exiting cleanly."
+        rm -f "$diff_out" "$pattern_file" "$py_script"
+        return 0
+    fi
+
+    # Append absolute exclusion for all other files to ensure ONLY the delta is extracted
+    echo "- **" >> "$pattern_file" 
+
+    print_msg "Delta Analysis Complete:"
+    echo " - Added files to extract:    $added_count"
+    echo " - Modified files to extract: $mod_count"
+    echo " - Removed files (skipped):   $rm_count"
+    echo " "
+
+    print_msg "Extracting $total_extract delta files from '$archive_b' to $stage_dir..."
+    
+    cd "$stage_dir" || die "Failed to enter $stage_dir"
+    
+    setup_temp_swap
+    if [ -n "${BORG_TMP_SWAP:-}" ]; then
+        CONF_EXCLUDES+=("--exclude=$BORG_TMP_SWAP")
+    fi
+
+    borg extract --sparse --patterns-from "$pattern_file" ::"$archive_b" || die "Extraction failed! Aborting."
+
+    # Cleanup temporary routing files
+    rm -f "$diff_out" "$pattern_file" "$py_script"
+
+    print_msg "Delta Restore Complete."
+    echo " => All changed/added files have been placed in: $stage_dir"
+    if [ "$rm_count" -gt 0 ]; then
+        echo " => A list of files that were REMOVED in the target state is saved at: $removed_list"
+    else
+        rm -f "$removed_list"
+    fi
+    
+    # Return to script execution dir
+    cd "$SCRIPT_DIR" || true
+}
+
 do_delete() {
     setup_ssh_connection
     sync_borg_version
@@ -1560,6 +1813,276 @@ do_delete() {
         die "Failed to delete archive '$archive'."
     fi
 }
+
+check_fuse_dependency() {
+    local missing=false
+    if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then missing=true; fi
+    
+    # Check if Python bindings for Borg are present
+    if ! python3 -c "import pyfuse3" >/dev/null 2>&1 && ! python3 -c "import llfuse" >/dev/null 2>&1; then missing=true; fi
+
+    if [ "$missing" = true ]; then
+        print_msg "[WARNING] FUSE or Borg Python bindings (llfuse/pyfuse3) are missing. Installing dynamically..."
+
+        local fuse_setuid="false"
+        echo -e "\n[SECURITY CONFIGURATION]"
+        read -p "Allow non-root users (userland) to mount FUSE filesystems? (y/N) " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            fuse_setuid="true"
+        fi
+
+        export DEBIAN_FRONTEND=noninteractive
+        if command -v debconf-set-selections >/dev/null 2>&1; then
+            echo "fuse fuse/setuid boolean $fuse_setuid" | debconf-set-selections 2>/dev/null || true
+            echo "fuse3 fuse3/setuid boolean $fuse_setuid" | debconf-set-selections 2>/dev/null || true
+        fi
+        apt-get update -qq && safe_apt_install fuse3
+        safe_apt_install python3-llfuse python3-pyfuse3 2>/dev/null || safe_apt_install python3-llfuse 2>/dev/null || true
+        print_msg "FUSE and Python bindings installed successfully."
+    fi
+}
+
+do_mount() {
+    garbage_collector
+    setup_ssh_connection
+    sync_borg_version
+
+    select_repository
+
+    local archive="${2:-}"
+    if [ -z "$archive" ]; then
+        archive=$(select_archive)
+    fi
+    archive=$(echo -n "$archive" | tr -d '\r' | xargs)
+    if [ -z "$archive" ]; then die "Archive selection resulted in an empty string. Aborting."; fi
+
+	check_fuse_dependency
+
+    local default_mount_dir="/mnt/borg_mount_$(date +%s)"
+    local mount_dir
+    read -p "Enter absolute path for mount directory [Default: $default_mount_dir]: " mount_dir
+    mount_dir=$(echo -n "$mount_dir" | tr -d '\r\n\t ')
+    if [ -z "$mount_dir" ]; then mount_dir="$default_mount_dir"; fi
+
+    mkdir -p "$mount_dir" || die "Failed to create mount directory: $mount_dir"
+
+    print_msg "Mounting archive $archive to $mount_dir (Read-Only)..."
+    borg mount ::"$archive" "$mount_dir" || die "Failed to mount archive."
+
+    # Track it for easier unmounting
+    echo "$mount_dir" >> /var/tmp/borg_mounts.list
+
+    print_msg "Archive successfully mounted.\n => Location: $mount_dir\n\nTo unmount, run: $0 unmount $mount_dir"
+}
+
+do_unmount() {
+    local target="${2:-}"
+    local mount_list=()
+
+    # 1. Clean and load tracked mounts from list file
+    if [ -f /var/tmp/borg_mounts.list ]; then
+        local valid_mounts=()
+        while IFS= read -r m_dir; do
+            m_dir=$(echo "$m_dir" | xargs)
+            if [ -n "$m_dir" ] && [ -d "$m_dir" ]; then
+                valid_mounts+=("$m_dir")
+            fi
+        done < /var/tmp/borg_mounts.list
+        
+        printf "%s\n" "${valid_mounts[@]}" > /var/tmp/borg_mounts.list 2>/dev/null || true
+        mount_list=("${valid_mounts[@]}")
+    fi
+
+    # 2. Fallback: Dynamically detect active Borg/FUSE mount points if list file is empty
+    if [ ${#mount_list[@]} -eq 0 ]; then
+        mapfile -t detected_mounts < <(awk '$3 ~ /fuse\.borg/ || $2 ~ /borg_mount|borg_chroot/ {print $2}' /proc/mounts 2>/dev/null | sort -u)
+        for dm in "${detected_mounts[@]}"; do
+            if [ -n "$dm" ] && [ -d "$dm" ]; then
+                mount_list+=("$dm")
+            fi
+        done
+    fi
+
+    if [ ${#mount_list[@]} -eq 0 ]; then
+        die "No active Borg mounts found to unmount."
+    fi
+
+    # 3. Handle selection logic
+    if [ -n "$target" ]; then
+        if [[ "$target" =~ ^[0-9]+$ ]] && [ "$target" -ge 1 ] && [ "$target" -le "${#mount_list[@]}" ]; then
+            target="${mount_list[$((target-1))]}"
+        fi
+    elif [ ${#mount_list[@]} -eq 1 ]; then
+        # Exactly one mount: skip prompting entirely
+        target="${mount_list[0]}"
+        echo " -> Only one active mount found ($target). Automatically unmounting..." >&2
+    else
+        # Multiple mounts: display numbered list
+        echo "" >&2
+        echo "========================================================" >&2
+        echo "                 ACTIVE MOUNTS" >&2
+        echo "========================================================" >&2
+        for i in "${!mount_list[@]}"; do
+            printf " %2d) %s\n" "$((i+1))" "${mount_list[$i]}" >&2
+        done
+        echo "========================================================" >&2
+        echo "" >&2
+
+        local selection
+        read -p "Select the mount to unmount (1-${#mount_list[@]}): " selection >&2
+        selection=$(echo -n "$selection" | tr -d '\r\n\t ')
+
+        if ! [[ "$selection" =~ ^[0-9]+$ ]] || [ "$selection" -lt 1 ] || [ "$selection" -gt "${#mount_list[@]}" ]; then
+            die "Invalid selection. Aborting."
+        fi
+        target="${mount_list[$((selection-1))]}"
+    fi
+
+    target=$(echo -n "$target" | tr -d '\r\n\t ')
+    if [ -z "$target" ] || [ ! -d "$target" ]; then
+        die "Invalid or missing directory: $target"
+    fi
+
+    print_msg "Unmounting $target..."
+    borg umount "$target" 2>/dev/null || umount "$target" 2>/dev/null || die "Failed to unmount $target"
+    
+    print_msg "Removing directory $target..."
+    rmdir "$target" || echo "[WARNING] Could not remove $target. Is it empty?"
+
+    if [ -f /var/tmp/borg_mounts.list ]; then
+        grep -v "^$target$" /var/tmp/borg_mounts.list > /var/tmp/borg_mounts.tmp 2>/dev/null || true
+        mv /var/tmp/borg_mounts.tmp /var/tmp/borg_mounts.list 2>/dev/null || true
+    fi
+    print_msg "Unmount complete."
+}
+
+do_chroot() {
+    garbage_collector
+    setup_ssh_connection
+    sync_borg_version
+
+    select_repository
+
+    local archive="${2:-}"
+    if [ -z "$archive" ]; then
+        archive=$(select_archive)
+    fi
+    archive=$(echo -n "$archive" | tr -d '\r' | xargs)
+    if [ -z "$archive" ]; then die "Archive selection resulted in an empty string. Aborting."; fi
+	
+	check_fuse_dependency
+    
+	local mount_dir="/tmp/borg_chroot_$(date +%s)"
+    mkdir -p "$mount_dir" || die "Failed to create temporary mount directory: $mount_dir"
+
+    print_msg "Mounting archive $archive to $mount_dir for chroot (Read-Only)..."
+    borg mount ::"$archive" "$mount_dir" || die "Failed to mount archive."
+
+    # Base system binds required for a functional chroot
+    local system_binds=("/dev" "/dev/pts" "/proc" "/sys" "/run" "/tmp")
+    
+    # User-configured exemptions (Add CONF_CHROOT_EXEMPTS=("/root/bin") to your .config file)
+    local config_binds=()
+    if [ -n "${CONF_CHROOT_EXEMPTS:-}" ]; then
+        if [[ "$(declare -p CONF_CHROOT_EXEMPTS 2>/dev/null)" =~ "declare -a" ]]; then
+            config_binds=("${CONF_CHROOT_EXEMPTS[@]}")
+        else
+            config_binds=("$CONF_CHROOT_EXEMPTS")
+        fi
+    fi
+
+    # Interactive session exemptions
+    echo -e "\n[CHROOT SANDBOX]"
+    echo "By default, critical system paths (/tmp, /dev, /proc, /sys, /run) are bound from the live OS."
+    if [ ${#config_binds[@]} -gt 0 ]; then
+        echo "Configured exemptions applied: ${config_binds[*]}"
+    fi
+    
+    local session_exempts_str
+    read -p "Enter any additional directories to exempt from the backup and map to live system (space separated): " session_exempts_str
+    
+    local session_binds=()
+    if [ -n "$session_exempts_str" ]; then
+        read -ra session_binds <<< "$session_exempts_str"
+    fi
+
+    # Combine and deduplicate
+    local all_binds=("${system_binds[@]}" "${config_binds[@]}" "${session_binds[@]}")
+    local unique_binds=()
+    for bind in "${all_binds[@]}"; do
+        if [ -n "$bind" ]; then
+            local exists=false
+            for u in "${unique_binds[@]}"; do
+                if [ "$u" == "$bind" ]; then exists=true; break; fi
+            done
+            if [ "$exists" = false ]; then unique_binds+=("$bind"); fi
+        fi
+    done
+
+    echo ""
+    echo "========================================================"
+    echo "        CHROOT ENVIRONMENT EXEMPTIONS (LIVE BIND)"
+    echo "========================================================"
+    for b in "${unique_binds[@]}"; do
+        echo " -> $b"
+    done
+    echo "========================================================"
+    echo ""
+    read -p "Press Enter to execute chroot session..."
+
+    local successful_binds=()
+
+    # Execute bind mounts safely
+    for bind in "${unique_binds[@]}"; do
+        if [ -e "$bind" ]; then
+            # Since the borg mount is read-only, the target directory MUST already exist in the backup to bind to it.
+            if [ -d "$bind" ] && [ ! -d "$mount_dir$bind" ]; then
+                echo "[WARNING] Directory $bind does not exist in the backup archive. Cannot bind-mount to a read-only filesystem."
+                continue
+            elif [ -f "$bind" ] && [ ! -f "$mount_dir$bind" ]; then
+                echo "[WARNING] File $bind does not exist in the backup archive. Cannot bind-mount to a read-only filesystem."
+                continue
+            fi
+            
+            if mount --bind "$bind" "$mount_dir$bind"; then
+                successful_binds+=("$bind")
+            else
+                echo "[WARNING] Failed to bind mount $bind"
+            fi
+        else
+            echo "[WARNING] Path $bind does not exist on the live OS. Skipping."
+        fi
+    done
+
+    # Safe Cleanup Handler
+    local cleanup_done=false
+    cleanup_chroot() {
+        if [ "$cleanup_done" = true ]; then return; fi
+        cleanup_done=true
+        echo -e "\n[INFO] Tearing down chroot environment..."
+        
+        # Reverse order for safe unmounting
+        for (( i=${#successful_binds[@]}-1 ; i>=0 ; i-- )); do
+            umount "$mount_dir${successful_binds[$i]}" 2>/dev/null || umount -l "$mount_dir${successful_binds[$i]}" 2>/dev/null || true
+        done
+        
+        borg umount "$mount_dir" 2>/dev/null || umount -l "$mount_dir" 2>/dev/null || true
+        rmdir "$mount_dir" 2>/dev/null || true
+        print_msg "Chroot session closed safely."
+    }
+    
+    # Catch interruptions to avoid stale mounts and maintain global swap cleanup mapping
+    trap 'cleanup_chroot; cleanup_temp_swap' EXIT INT TERM QUIT
+
+    print_msg "Entering Chroot. Type 'exit' or press CTRL+D to leave."
+    chroot "$mount_dir" /bin/bash
+
+    # Restore original trap and execute cleanup normally
+    trap cleanup_temp_swap EXIT INT TERM QUIT
+    cleanup_chroot
+}
+
 
 check_self_update() {
     echo " "
@@ -1637,6 +2160,7 @@ case "${1:-}" in
     install)      do_install ;;
     backup)       do_backup "${2:-}" ;;
     check)        do_check ;;
+	repair)       do_repair ;;
     delete)       do_delete "$@" ;;
     list)         do_list ;;
     housekeeping) do_housekeeping ;;
@@ -1644,18 +2168,52 @@ case "${1:-}" in
     restore-live) do_restore_live "$@" ;;
 	restore-to-stage) do_restore_stage "$@" ;;
 	clean-stage)  do_clean_stage ;;
+    restore-delta) do_restore_delta "$@" ;;
+	mount)        do_mount "$@" ;;
+    unmount)      do_unmount "$@" ;;
+    chroot)       do_chroot "$@" ;;
     *)
-        echo "Usage: $0 install"
-        echo "       $0 backup [\"comment\"]"
-        echo "       $0 check"
-        echo "       $0 delete"
-        echo "       $0 list"
-        echo "       $0 housekeeping"
-        echo "       $0 restore-file"
-        echo "       $0 restore-live"
-		echo "       $0 restore-to-stage"
-		echo "       $0 clean-stage"
-        echo " "
+		echo ""
+		echo " $0 – Full-System Borg Backup & Bare-Metal Recovery"
+		echo ""
+		echo " Description:"
+		echo "   A master backup utility for creating, managing, and restoring"
+		echo "   Borg-based full-system backups. Supports Hetzner Storage Box"
+		echo "   repositories (SSH mode) and local mounted repositories."
+		echo ""
+		echo " Usage:"
+		echo "   $0 <command> [options] [arguments]"
+		echo ""
+		echo " Commands:"
+		echo "   install                Install all required packages and initialize repository"
+		echo "   backup [comment]       Create a full-system backup (optional comment)"
+		echo "   check                  Verify repository integrity"
+		echo "   repair                 Repair repository integrity"
+		echo "   list                   List available backup archives"
+		echo ""
+		echo "   restore-live"
+		echo "                         Restore the live system"
+		echo ""
+		echo "   restore-file [archive] [path]"
+		echo "                         Restore a single file or directory from a backup"
+		echo "                         If archive or path is omitted, an interactive selector opens"
+		echo ""
+		echo "   select-repo           Interactively choose a repository (local or Hetzner)"
+		echo "   select-archive        Interactively choose an archive"
+		echo ""
+		echo "   restore-delta         Compare two backups and extract ONLY the changed/added files"
+		echo ""
+		echo "   mount [archive]       Mount a backup to a dynamically created subdirectory"
+		echo "   unmount [dir]         Unmount and delete the dynamically created subdirectory"
+		echo "   chroot [archive]      Mount and chroot into a backup (read-only)"
+		echo " Options:"
+		echo "   help                  Show this help message"
+		echo ""
+		echo " Notes:"
+		echo "   • SSH mode automatically manages keys and vaulting on Hetzner."
+		echo "   • Temporary swap is created automatically if memory is low."
+		echo "   • Database dumps are created if enabled in the config."
+		echo ""
         exit 1
         ;;
 esac

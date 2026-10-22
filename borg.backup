@@ -53,8 +53,27 @@ fi
 # FUNCTIONS
 # ==============================================================================
 
+send_ntfy_warning() {
+    local message="${1:-}"
+    if [[ -n "${NTFY_SERVER:-}" && -n "${NTFY_TOPIC:-}" ]]; then
+        local title="Borg Backup Alert: ${CONF_MACHINE_NAME:-Unknown}"
+        curl -s -X POST "${NTFY_SERVER}/${NTFY_TOPIC}" \
+            --connect-timeout 5 \
+            --max-time 10 \
+            -H "Title: ${title}" \
+            -H "Priority: high" \
+            -H "Tags: rotating_light,warning" \
+            -d "${message}" > /dev/null 2>&1 & disown
+    fi
+}
+
+die() { 
+    echo -e "\n[FATAL ERROR] $1" >&2
+    send_ntfy_warning "FATAL ERROR: $1"
+    exit 1; 
+}
+
 print_msg() { echo -e "\n=============================================================================\n[$(date '+%Y-%m-%d %H:%M:%S')] => $1 \n"; }
-die() { echo -e "\n[FATAL ERROR] $1" >&2; exit 1; }
 
 
 safe_apt_install() {
@@ -472,7 +491,11 @@ do_backup() {
         if command -v mysqldump >/dev/null 2>&1 && mysqladmin ping >/dev/null 2>&1; then
             print_msg "Dumping databases for consistency"
             mkdir -p "$CONF_DB_DUMP_DIR"
-            mysqldump --all-databases --single-transaction --quick --lock-tables=false > "$CONF_DB_DUMP_DIR/all-databases-$(date +%F).sql"
+            
+            if ! mysqldump --all-databases --single-transaction --quick --lock-tables=false > "$CONF_DB_DUMP_DIR/all-databases-$(date +%F).sql"; then
+                send_ntfy_warning "Database dump (mysqldump) failed before backup! The resulting archive will lack consistent database states."
+            fi
+
             find "$CONF_DB_DUMP_DIR" -name "*.sql" -mtime +3 -delete
         else
             print_msg "Database dump requested, but MySQL/MariaDB is not installed or not running. Skipping."
@@ -506,6 +529,9 @@ do_backup() {
     local backup_exit=$?
 
     if [ $backup_exit -eq 0 ] || [ $backup_exit -eq 1 ]; then
+        if [ $backup_exit -eq 1 ]; then
+            send_ntfy_warning "Backup completed with warnings (Exit Code 1). File read errors or inconsistencies found."
+        fi
         print_msg "Backup successful. Pruning old backups."
         borg prune \
             --list \
@@ -515,9 +541,19 @@ do_backup() {
             --keep-daily "$CONF_KEEP_DAILY" \
             --keep-weekly "$CONF_KEEP_WEEKLY" \
             --keep-monthly "$CONF_KEEP_MONTHLY"
+
+        local prune_exit=$?
+        if [ $prune_exit -ne 0 ]; then
+            send_ntfy_warning "Errors or inconsistencies found during backup pruning! (Exit Code $prune_exit)"
+        fi
         
         print_msg "Compacting repository to free physical disk space."
         borg compact --show-rc
+
+        local compact_exit=$?
+        if [ $compact_exit -ne 0 ]; then
+            send_ntfy_warning "Errors or inconsistencies found during repository compaction! (Exit Code $compact_exit)"
+        fi
         
     else
         die "Backup failed with exit code $backup_exit"
@@ -528,13 +564,21 @@ do_backup() {
 do_check() {
     sync_borg_version
     print_msg "Verifying backup repository integrity"
-    borg check --repository-only --show-rc
+    if ! borg check --repository-only --show-rc; then
+        send_ntfy_warning "Inconsistency detected during repository check!"
+        echo -e "\n[ERROR] Borg check found inconsistencies." >&2
+        return 1
+    fi
 }
 
 do_repair() {
     sync_borg_version
     print_msg "Attempting to repair corrupted repository"
-    borg check --repair --show-rc
+    if ! borg check --repair --show-rc; then
+        send_ntfy_warning "Repository repair failed or found unfixable errors!"
+        echo -e "\n[ERROR] Borg repair failed or found unfixable errors." >&2
+        return 1
+    fi
 }
 
 do_list() {
@@ -1343,6 +1387,11 @@ do_restore_live() {
         "${CONF_EXCLUDES[@]:-}" \
         "$stage_dir/" /
 
+    local rsync_exit=$?
+    if [ $rsync_exit -ne 0 ]; then
+        send_ntfy_warning "LIVE RESTORE WARNING: Rsync filesystem swap completed with exit code $rsync_exit. The system may be in an inconsistent state."
+    fi
+
     # ==============================================================================
     # MANDATORY POST-SYNC BOOT REPAIR
     # ==============================================================================
@@ -1808,9 +1857,44 @@ do_delete() {
     
     if [ $? -eq 0 ]; then
         print_msg "Archive deleted successfully. Compacting repository to free physical disk space..."
-        borg compact --show-rc
+        if ! borg compact --show-rc; then
+            send_ntfy_warning "Errors found during repository compaction after deleting '$archive'."
+        fi
     else
         die "Failed to delete archive '$archive'."
+    fi
+}
+
+do_delete_all_but_last() {
+    setup_ssh_connection
+    sync_borg_version
+    
+    select_repository
+
+    print_msg "WARNING: MASS ARCHIVE DELETION INITIATED"
+    echo "Target Repository: $BORG_REPO"
+    echo "This will permanently DELETE ALL BACKUPS except the single most recent one."
+    echo "This action is IRREVERSIBLE."
+    read -p "Are you absolutely sure you want to prune all old archives? (y/N) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        die "Aborted."
+    fi
+
+    print_msg "Pruning repository to keep only the last archive..."
+    borg prune \
+        --list \
+        --glob-archives "${CONF_ARCHIVE_PREFIX}*" \
+        --show-rc \
+        --keep-last 1
+    
+    if [ $? -eq 0 ]; then
+        print_msg "Delete successful. Compacting repository to free physical disk space..."
+        if ! borg compact --show-rc; then
+            send_ntfy_warning "Errors found during repository compaction after mass deletion."
+        fi
+    else
+        die "Failed to delete archives."
     fi
 }
 
@@ -2162,6 +2246,7 @@ case "${1:-}" in
     check)        do_check ;;
 	repair)       do_repair ;;
     delete)       do_delete "$@" ;;
+	delete-all-old)    do_delete_all_but_last ;;
     list)         do_list ;;
     housekeeping) do_housekeeping ;;
     restore-file) do_restore_file "$@" ;;
@@ -2190,6 +2275,9 @@ case "${1:-}" in
 		echo "   check                  Verify repository integrity"
 		echo "   repair                 Repair repository integrity"
 		echo "   list                   List available backup archives"
+		echo "   delete [archive]       Permanently delete a specific backup archive"
+		echo "   delete-all-old         Permanently delete ALL backups except the single most recent one"
+		echo "   housekeeping           Clean up stale SSH keys and orphaned locks"
 		echo ""
 		echo "   restore-live"
 		echo "                         Restore the live system"

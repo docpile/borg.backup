@@ -7,7 +7,7 @@ Borg backup script to automate backups/restores using either a Hetzner Storage B
 * Arch Linux
 * openSUSE / SUSE Enterprise Server (SLES)
   
-However, up to now it was only thoroughly tested on Ubuntu. 
+However, up to now it was only thoroughly tested on Ubuntu. Optionally uses the ntfy.sh open source service to deliver error messages to the user, e.g. for headless servers and for cron usage.
 
 **How it works:**
 * It backups/restores strictly on a file level. This means, no partition table changes are done. The partitions must be prepared beforehand
